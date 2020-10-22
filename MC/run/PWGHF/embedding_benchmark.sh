@@ -184,7 +184,7 @@ for tf in `seq 1 ${NTIMEFRAMES}`; do
   taskwrapper trddigi_${tf}.log o2-sim-digitizer-workflow $gloOpt -n ${NSIGEVENTS} --sims bkg,sgn${tf} --onlyDet TRD --interactionRate 50000 --configKeyValues "TRDSimParams.digithreads=10" --incontext ${CONTEXTFILE}
   echo "Return status of TRD digitization: $?"
 
-  taskwrapper restdigi_${tf}.log o2-sim-digitizer-workflow $gloOpt -n ${NSIGEVENTS} --sims bkg,sgn${tf} --skipDet TRD,TPC --interactionRate 50000 --incontext ${CONTEXTFILE}
+  taskwrapper restdigi_${tf}.log o2-sim-digitizer-workflow $gloOpt -n ${NSIGEVENTS} --sims bkg,sgn${tf} --skipDet TRD,TPC,FV0 --interactionRate 50000 --incontext ${CONTEXTFILE}
   echo "Return status of OTHER digitization: $?"
 
   taskwrapper tpcreco_${tf}.log o2-tpc-reco-workflow $gloOpt --tpc-digit-reader \"--infile tpcdigits.root\" --input-type digits --output-type clusters,tracks  --tpc-track-writer \"--treename events --track-branch-name Tracks --trackmc-branch-name TracksMCTruth\" --configKeyValues \"GPU_global.continuousMaxTimeBin=10000\"
