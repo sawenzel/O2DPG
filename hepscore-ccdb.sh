@@ -12,6 +12,7 @@ build_requires:
 
 export ROOT_INCLUDE_PATH=${ROOT_INCLUDE_PATH}:${PYTHIA_ROOT}/include
 export ROOT_INCLUDE_PATH=${ROOT_INCLUDE_PATH}:${HEPMC3_ROOT}/include 
+export ROOT_INCLUDE_PATH=${ROOT_INCLUDE_PATH}:${FAIRMQ_ROOT}/include 
 
 env | tr ":" "\n" > runenv.log
 
