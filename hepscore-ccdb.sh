@@ -10,6 +10,8 @@ build_requires:
 # - publish CCDB snapshot on CVFMS via alibuild/jenkins
 # - allow execution of benchmark without ALIEN token/network
 
+env | tr ":" "\n" > runenv.log
+
 # Set Geant4 data sets environment
 [ "$G4INSTALL" != "" ] && \
 `$G4INSTALL/bin/geant4-config --datasets | sed 's/[^ ]* //' | sed 's/G4/export G4/' | sed 's/DATA /DATA=/'`
