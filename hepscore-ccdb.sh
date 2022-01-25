@@ -10,6 +10,9 @@ build_requires:
 # - publish CCDB snapshot on CVFMS via alibuild/jenkins
 # - allow execution of benchmark without ALIEN token/network
 
+export ROOT_INCLUDE_PATH=${ROOT_INCLUDE_PATH}:${PYTHIA_ROOT}/include
+export ROOT_INCLUDE_PATH=${ROOT_INCLUDE_PATH}:${HEPMC3_ROOT}/include 
+
 env | tr ":" "\n" > runenv.log
 
 # Set Geant4 data sets environment
