@@ -1,5 +1,5 @@
 package: HEPscore-CCDB
-version: v0.1-test
+version: v0.1.1-test
 build_requires:
   - O2sim
   - alibuild-recipe-tools
@@ -25,7 +25,7 @@ NSIGEVENTS=1 NBKGEVENTS=1 NTIMEFRAMES=1 ${O2DPG_ROOT}/MC/run/HEPscore/hep-score.
 
 # install artefacts
 rsync -a --delete .ccdb $INSTALLROOT
-mkdir -p $INSTALLROOT/data && rsync -a --delete *.bin $INSTALLROOT/data
+mkdir -p $INSTALLROOT/data && rsync -a --delete matbud.rood $INSTALLROOT/data
 
 # Modulefile
 mkdir -p $INSTALLROOT/etc/modulefiles
