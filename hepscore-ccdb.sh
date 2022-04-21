@@ -24,6 +24,7 @@ env | tr ":" "\n" > runenv.log
 alien.py ls /alice/cern.ch/user/a/aliperf/
 
 # launch the reference simulation (to fetch all needed CCDB objects and to cache them)
+export ALICE_O2SIM_DUMPLOG=ON
 NSIGEVENTS=1 NBKGEVENTS=1 NTIMEFRAMES=1 ${O2DPG_ROOT}/MC/run/HEPscore/hep-score.sh
 cp bkg_serverlog bkg_serverlog.log
 cp bkg_workerlog0 bkg_workerlog0.log
