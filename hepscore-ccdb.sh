@@ -4,7 +4,7 @@ build_requires:
   - O2sim
   - alibuild-recipe-tools
 ---
-#!/bin/bash -e
+#!/bin/bash
 
 # A build recipe producing a CCDB snapshot for the HEPscore benchmark.
 # - publish CCDB snapshot on CVFMS via alibuild/jenkins
@@ -20,8 +20,15 @@ env | tr ":" "\n" > runenv.log
 [ "$G4INSTALL" != "" ] && \
 `$G4INSTALL/bin/geant4-config --datasets | sed 's/[^ ]* //' | sed 's/G4/export G4/' | sed 's/DATA /DATA=/'`
 
+# check if we can access alien
+alien.py ls /alice/cern.ch/user/a/aliperf/
+
 # launch the reference simulation (to fetch all needed CCDB objects and to cache them)
 NSIGEVENTS=1 NBKGEVENTS=1 NTIMEFRAMES=1 ${O2DPG_ROOT}/MC/run/HEPscore/hep-score.sh
+cp bkg_serverlog bkg_serverlog.log
+cp bkg_workerlog0 bkg_workerlog0.log
+cp bkg_mergerlog bkg_mergerlog.log
+exit 1
 
 # install artefacts
 rsync -a --delete .ccdb $INSTALLROOT
