@@ -15,6 +15,9 @@ export ROOT_INCLUDE_PATH=${ROOT_INCLUDE_PATH}:${HEPMC3_ROOT}/include
 export ROOT_INCLUDE_PATH=${ROOT_INCLUDE_PATH}:${FAIRMQ_ROOT}/include
 # this is to access tokens and alien
 export PYTHONPATH=${PYTHONPATH}:${XJALIENFS_ROOT}/lib/python/site-packages
+export X509_USER_CERT=/etc/grid-security/hostcert.pem 
+export X509_USER_KEY=/etc/grid-security/hostkey.pem 
+export X509_CERT_DIR=/etc/grid-security/certificates
 
 env | tr ":" "\n" > runenv.log
 
