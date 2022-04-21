@@ -18,6 +18,7 @@ export PYTHONPATH=${PYTHONPATH}:${XJALIENFS_ROOT}/lib/python/site-packages
 export X509_USER_CERT=/etc/grid-security/hostcert.pem 
 export X509_USER_KEY=/etc/grid-security/hostkey.pem 
 export X509_CERT_DIR=/etc/grid-security/certificates
+export PATH=${PATH}:${XJALIENFS_ROOT}/bin
 
 env | tr ":" "\n" > runenv.log
 
@@ -26,7 +27,8 @@ env | tr ":" "\n" > runenv.log
 `$G4INSTALL/bin/geant4-config --datasets | sed 's/[^ ]* //' | sed 's/G4/export G4/' | sed 's/DATA /DATA=/'`
 
 # check if we can access alien
-alien.py ls /alice/cern.ch/user/a/aliperf/
+# alien.py ls /alice/cern.ch/user/a/aliperf/
+alien-token-info || True
 
 # launch the reference simulation (to fetch all needed CCDB objects and to cache them)
 export ALICE_O2SIM_DUMPLOG=ON
