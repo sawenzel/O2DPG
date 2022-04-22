@@ -40,7 +40,7 @@ cp bkg_mergerlog bkg_mergerlog.log
 
 # install artefacts
 rsync -a --delete .ccdb $INSTALLROOT
-mkdir -p $INSTALLROOT/data && rsync -a --delete matbud.rood $INSTALLROOT/data
+mkdir -p $INSTALLROOT/data && rsync -a --delete matbud.root $INSTALLROOT/data
 
 # Modulefile
 mkdir -p $INSTALLROOT/etc/modulefiles
