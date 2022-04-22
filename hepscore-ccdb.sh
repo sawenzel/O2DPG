@@ -13,6 +13,7 @@ build_requires:
 export ROOT_INCLUDE_PATH=${ROOT_INCLUDE_PATH}:${PYTHIA_ROOT}/include
 export ROOT_INCLUDE_PATH=${ROOT_INCLUDE_PATH}:${HEPMC3_ROOT}/include 
 export ROOT_INCLUDE_PATH=${ROOT_INCLUDE_PATH}:${FAIRMQ_ROOT}/include
+export ROOT_INCLUDE_PATH=${ROOT_INCLUDE_PATH}:${TBB_ROOT}/include
 # this is to access tokens and alien
 export PYTHONPATH=${PYTHONPATH}:${XJALIENFS_ROOT}/lib/python/site-packages
 export X509_USER_CERT=/etc/grid-security/hostcert.pem 
@@ -36,7 +37,6 @@ NSIGEVENTS=1 NBKGEVENTS=1 NTIMEFRAMES=1 ${O2DPG_ROOT}/MC/run/HEPscore/hep-score.
 cp bkg_serverlog bkg_serverlog.log
 cp bkg_workerlog0 bkg_workerlog0.log
 cp bkg_mergerlog bkg_mergerlog.log
-exit 1
 
 # install artefacts
 rsync -a --delete .ccdb $INSTALLROOT
