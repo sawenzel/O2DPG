@@ -1,5 +1,5 @@
 package: HEPscore-CCDB
-version: v0.1.1-test
+version: v0.1.2-test
 build_requires:
   - O2sim
   - alibuild-recipe-tools
