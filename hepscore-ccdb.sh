@@ -29,7 +29,7 @@ env | tr ":" "\n" > runenv.log
 
 # check if we can access alien
 # alien.py ls /alice/cern.ch/user/a/aliperf/
-alien-token-info || True
+alien-token-info || true
 
 # launch the reference simulation (to fetch all needed CCDB objects and to cache them)
 export ALICE_O2SIM_DUMPLOG=ON
