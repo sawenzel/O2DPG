@@ -45,6 +45,7 @@ parser.add_argument('-productionTag',help="Production tag for this MC", default=
 # - some external tool should sample it within
 # - we can also sample it ourselfs here
 parser.add_argument('--timestamp', type=int, help="Anchoring timestamp (defaults to now)", default=-1)
+parser.add_argument('--condition-not-after', type=int, help="CCDB objects not created after this timestamp (for TimeMachine)", default=3385078236000)
 parser.add_argument('--anchor-config',help="JSON file to contextualise workflow with external configs (config values etc.) for instance comping from data reco workflows.", default='')
 parser.add_argument('-ns',help='number of signal events / timeframe', default=20)
 parser.add_argument('-gen',help='generator: pythia8, extgen', default='')
@@ -250,8 +251,10 @@ workflow={}
 workflow['stages'] = []
 
 
-def getDPL_global_options(bigshm=False):
-   common=" -b --run " # --driver-client-backend ws:// "
+def getDPL_global_options(bigshm=False, ccdbbackend=True):
+   common=" -b --run "
+   if ccdbbackend:
+     common=common + " --condition-not-after " + str(args.condition_not_after)
    if args.noIPC!=None:
       return common + " --no-IPC "
    if bigshm:
