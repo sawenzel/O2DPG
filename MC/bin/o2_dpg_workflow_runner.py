@@ -481,6 +481,7 @@ def get_alienv_software_environment(packagestring):
 
     return envmap
 
+from subprocess import check_output
 #
 # functions for execution; encapsulated in a WorkflowExecutor class
 #
@@ -492,9 +493,10 @@ class WorkflowExecutor:
       self.workflowspec = load_json(workflowfile)
       self.globalenv = self.extract_global_environment(self.workflowspec) # initialize global environment settings
       for e in self.globalenv:
-        if os.environ.get(e, None) == None:
-           actionlogger.info("Applying global environment from init section " + str(e) + " : " + str(self.globalenv[e]))
-           os.environ[e] = str(self.globalenv[e])
+          # we let bash do the final parameter expansion; in this way we can have generic and programmable init sections
+          tmp = check_output(["bash","-c","echo \"{}\"".format(str(self.globalenv[e]))]).decode('ascii').rstrip()
+          actionlogger.info("Applying global environment from init section " + str(e) + " : " + tmp)
+          os.environ[e] = tmp
 
       self.workflowspec = filter_workflow(self.workflowspec, args.target_tasks, args.target_labels)
 
