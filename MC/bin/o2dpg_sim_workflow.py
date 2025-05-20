@@ -1156,6 +1156,7 @@ for tf in range(1, NTIMEFRAMES + 1):
       if COLTYPE == 'PbPb':
          tpcLocalCFreco['TPCCorrMap.lumiInstFactor'] = str(lumiInstFactor)
       tpc_corr_options_mc=' --corrmap-lumi-mode 2 '
+      tpcLocalCFreco['TPCCorrMap.lumiMean'] = str(CTPSCALER)
       tpcLocalCFreco['TPCCorrMap.lumiInst'] = str(CTPSCALER)
 
    # Setup the TPC correction scaling options for reco; They come from the anchoring setup
@@ -1165,7 +1166,10 @@ for tf in range(1, NTIMEFRAMES + 1):
    # - But if the MC simulation was done with distortions, then the reco needs --lumy-type 1 (i.e. scale with the CTP lumi) even if the corresponding anchor run reco was using --lumy-type 2
    #   (i.e. scaling according to the TPC IDC, which don't exist in the MC).
 
-   anchor_lumi_type = dpl_option_from_config(anchorConfig, 'o2-tpcits-match-workflow', '--lumi-type', section = 'full', default_value = '')
+   if tpcDistortionType == 2:
+      anchor_lumi_type = 1
+   else:
+      anchor_lumi_type = dpl_option_from_config(anchorConfig, 'o2-tpcits-match-workflow', '--lumi-type', section = 'full', default_value = '')
    if anchor_lumi_type != '':
       anchor_lumi_type = '--lumi-type ' + anchor_lumi_type
    anchor_corrmaplumi_mode = dpl_option_from_config(anchorConfig, 'o2-tpcits-match-workflow', '--corrmap-lumi-mode', section = 'full', default_value = '')
