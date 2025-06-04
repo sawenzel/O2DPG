@@ -118,7 +118,33 @@ def retrieve_Aggregated_RunInfos(run_number):
             "FirstOrbit" : runInfo.orbitSOR,
             "LastOrbit" : runInfo.orbitEOR,
             "OrbitsPerTF" : int(runInfo.orbitsPerTF),
-            "detList" : detList}
+            "detList" : detList, 
+            "object" : runInfo}
+
+def upload_Aggregated_RunInfo(run_info_obj, splitid):
+    """
+    Uploads the final Aggregated RunInfo object for this MC to CCDB, so that
+    Analysis can query it.
+    To avoid traffic, only done for the first few splitids within a whole anchored MC production.
+    In any case, the upload will only be done if there is not yet an object registered.
+    """
+    if splitid > 10:
+      return
+
+    lpm_prod_tag = os.environ.get("ALIEN_JDL_LPMPRODUCTIONTAG")
+    if lpm_prod_tag == None:
+      return
+
+    # we do this only in GRID productions (or when JALIEN_USER is defined)
+    username = os.environ.get("JALIEN_USER")
+    if username == None:
+      return
+
+    print (f"Uploading MC meta information for production tag {lpm_prod_tag} and username {username}")
+    o2.parameters.AggregatedRunInfo.publishToCCDB_MC(run_info_obj, o2.ccdb.BasicCCDBManager.instance(),
+                                                     run_info_obj.runNumber,
+                                                     lpm_prod_tag,
+                                                     username)
 
 
 def parse_orbits_per_tf(orbitsPerTF, intRate):
@@ -488,6 +514,7 @@ def main():
        if determined_orbits != -1:
          print("Adjusting orbitsPerTF from " + str(GLOparams["OrbitsPerTF"]) + " to " + str(determined_orbits))
          GLOparams["OrbitsPerTF"] = determined_orbits
+         GLOparams["object"].orbitsPerTF = determined_orbits
 
     # determine timestamp, and production offset for the final MC job to run
     timestamp, prod_offset = determine_timestamp(run_start, run_end, [args.split_id - 1, args.prod_split], args.cycle, args.tf, GLOparams["OrbitsPerTF"])
@@ -539,6 +566,9 @@ def main():
                    + str(GLOparams["FirstOrbit"]) + " -field ccdb -bcPatternFile ccdb" + " --orbitsPerTF " + str(GLOparams["OrbitsPerTF"]) + " -col " + str(ColSystem) + " -eCM " + str(eCM) + ' --readoutDets ' + GLOparams['detList']
     print ("forward args ", forwardargs)
     cmd = "${O2DPG_ROOT}/MC/bin/o2dpg_sim_workflow.py " + forwardargs
+
+    # We store Information on how this MC was done in a special CCDB object
+    upload_Aggregated_RunInfo(GLOparams["object"], args.split_id)
 
     if job_is_exluded:
       print ("TIMESTAMP IS EXCLUDED IN RUN")

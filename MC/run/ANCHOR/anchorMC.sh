@@ -364,6 +364,25 @@ fi
 
 export FAIRMQ_IPC_PREFIX=./
 
+# -- Define meta-data to be inserted into AOD (for debugging purposes etc)
+# List of desired env variables to include in meta-data
+vars=("ALIEN_JDL_MC_ORBITS_PER_TF" "ALIEN_JDL_ANCHOR_SIM_OPTIONS")
+
+# Start building jq arguments and JSON object source
+jq_args=()
+jq_code='.'
+
+for var in "${vars[@]}"; do
+    val="${!var}"            # Indirect variable expansion
+    jq_args+=(--arg "$var" "$val")
+    jq_code+=" | .${var} = \$${var}"
+done
+
+# Run jq to build the JSON and write to file
+export AOD_ADDITIONAL_METADATA_FILE="${PWD}/aod_additional_MC_meta_info.json"
+jq -n "${jq_args[@]}" "$jq_code" > ${AOD_ADDITIONAL_METADATA_FILE}
+# -- End of AOD META-INFO section
+
 echo_info "Ready to start main workflow"
 
 ${O2DPG_ROOT}/MC/bin/o2_dpg_workflow_runner.py -f workflow.json -tt ${ALIEN_JDL_O2DPGWORKFLOWTARGET:-aod} --cpu-limit ${ALIEN_JDL_CPULIMIT:-8} --dynamic-resources
