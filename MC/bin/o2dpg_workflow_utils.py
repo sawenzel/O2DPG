@@ -38,7 +38,8 @@ def compute_n_workers(interaction_rate, collision_system, n_workers_user=8, n_wo
     Start with 1 worker at IR=0
     Go linearly until interaction_rate_linear_below
     """
-    if collision_system == "PbPb" or interaction_rate >= interaction_rate_linear_below:
+    # for systems other than pp we just use the nominal workers
+    if collision_system != "pp" or interaction_rate >= interaction_rate_linear_below:
         return n_workers_user
 
     n_workers_min = max(1, n_workers_min)
