@@ -82,7 +82,7 @@ done
 
         # inject custom repo if available
         if [ "${O2DPG_CUSTOM_REPO}" ]; then
-          sed -i "s/%{O2DPG_CUSTOM_REPO}/${O2DPG_CUSTOM_REPO}/g" "$OUTPUT_FILE_FINAL"
+          sed -i "s|%{O2DPG_CUSTOM_REPO}|${O2DPG_CUSTOM_REPO}|g" "$OUTPUT_FILE_FINAL"
         fi
 
         TOPWORKDIR=2tag_release_testing_${BUILD_TAG:-${SOFTWARETAG_SIM}}
