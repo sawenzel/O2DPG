@@ -31,7 +31,8 @@ class RunnerConfig:
     drop_should_break: bool = False        # let timeframe policy scan past non-fitting
 
     # --- systemd-run slice ---
-    systemd_run_spec: Optional[str] = None  # raw "ncpus:N/mem:M" spec for logging; re-exec already done
+    systemd_run_spec: Optional[str] = None    # raw "ncpus:N/mem:M/name:S" spec, kept for metric meta
+    systemd_slice_name: Optional[str] = None  # parsed "name:" value; used for child scope names
 
     # --- new monitor knobs ---
     monitor_interval_cpu: float = 1.0

@@ -116,6 +116,13 @@ def build_parser() -> argparse.ArgumentParser:
 
 def _args_to_config(ns: argparse.Namespace) -> RunnerConfig:
     target_tasks = [f.strip('"').strip("'") for f in ns.target_tasks]
+    # Extract slice name from spec so the executor can name child scopes.
+    slice_name: Optional[str] = None
+    if ns.systemd_run_spec:
+        try:
+            _, _, slice_name = _parse_systemd_run_spec(ns.systemd_run_spec)
+        except ValueError:
+            pass  # error already caught at re-exec time
     return RunnerConfig(
         workflowfile=ns.workflowfile,
         maxjobs=ns.maxjobs,
@@ -127,6 +134,7 @@ def _args_to_config(ns: argparse.Namespace) -> RunnerConfig:
         optimistic_resources=ns.optimistic_resources,
         in_systemd_slice=bool(os.environ.get(_IN_SLICE_ENV)),
         systemd_run_spec=ns.systemd_run_spec,
+        systemd_slice_name=slice_name,
         scheduler_policy=ns.scheduler_policy,
         drop_should_break=ns.drop_should_break,
         monitor_interval_cpu=ns.monitor_interval_cpu,
@@ -151,15 +159,16 @@ def _args_to_config(ns: argparse.Namespace) -> RunnerConfig:
     )
 
 
-def _parse_systemd_run_spec(spec: str) -> Tuple[Optional[str], Optional[str]]:
-    """Parse "ncpus:N/mem:M" into (cpu_quota_str, mem_str).
+def _parse_systemd_run_spec(spec: str) -> Tuple[Optional[str], Optional[str], str]:
+    """Parse "ncpus:N/mem:M/name:S" into (cpu_quota_str, mem_str, slice_name).
 
     ncpus is given as a number of cores and converted to systemd CPUQuota
     format (e.g. 8 cores → "800%").  mem is passed through as-is.
-    Either part may be absent.
+    name sets the systemd slice name (default "o2dpg").  Any part may be absent.
     """
     cpu_quota: Optional[str] = None
     mem: Optional[str] = None
+    slice_name: str = "o2dpg"
     for part in spec.split("/"):
         part = part.strip()
         if not part:
@@ -177,10 +186,12 @@ def _parse_systemd_run_spec(spec: str) -> Tuple[Optional[str], Optional[str]]:
             cpu_quota = f"{int(cores * 100)}%"
         elif key == "mem":
             mem = val
+        elif key == "name":
+            slice_name = val
         else:
             raise ValueError(f"Unknown key in --systemd-run spec: {key!r}. "
-                             f"Supported: ncpus, mem")
-    return cpu_quota, mem
+                             f"Supported: ncpus, mem, name")
+    return cpu_quota, mem, slice_name
 
 
 def _maybe_reexec_in_slice(ns: argparse.Namespace) -> None:
@@ -205,13 +216,16 @@ def _maybe_reexec_in_slice(ns: argparse.Namespace) -> None:
         return
 
     try:
-        cpu_quota, mem = _parse_systemd_run_spec(spec)
+        cpu_quota, mem, slice_name = _parse_systemd_run_spec(spec)
     except ValueError as e:
         print(f"Error in --systemd-run spec: {e}", file=sys.stderr)
         sys.exit(1)
 
-    unit_name = f"o2dpg-runner-{os.getpid()}"
-    cmd = ["systemd-run", "--user", "--scope", f"--unit={unit_name}"]
+    # Ensure the slice name has the .slice suffix expected by systemd.
+    systemd_slice = slice_name if slice_name.endswith(".slice") else f"{slice_name}.slice"
+    unit_name = f"o2dpg-runner-{os.getpid()}.scope"
+    cmd = ["systemd-run", "--user", "--scope", "--collect",
+           f"--unit={unit_name}", f"--slice={systemd_slice}"]
     if cpu_quota:
         cmd.append(f"--property=CPUQuota={cpu_quota}")
     if mem:

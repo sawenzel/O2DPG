@@ -37,7 +37,7 @@ class TaskSnapshot:
     tid: int
     name: str
     t_delta_ms: int = 0
-    cpu_pct: float = 0.0   # 0..100 * n_cores
+    cpu_pct: float = 0.0   # 0..100 * n_cores  (psutil)
     uss_mb: float = 0.0
     pss_mb: float = 0.0
     swap_mb: float = 0.0
@@ -45,6 +45,9 @@ class TaskSnapshot:
     labels: List[str] = field(default_factory=list)
     disc_mb: float = -1.0  # global disc usage (same value on all tasks, or -1)
     mem_fresh: bool = False  # did this snapshot's mem numbers come from a fresh read?
+    # cgroup-based metrics (None when not in a systemd slice / no per-task scope)
+    cgroup_cpu_pct: Optional[float] = None   # aggregate CPU % from cgroup cpu.stat
+    cgroup_mem_mb: Optional[float] = None    # aggregate memory from cgroup memory.current
 
 
 def _get_child_procs_fallback(base_pid: int) -> List[int]:
@@ -198,43 +201,55 @@ class PsutilBackend:
         return cpu_sum, pss_mb, uss_mb, swap_mb, nice
 
 
+def _read_cgroup_v2_dir(pid: int) -> Optional[str]:
+    """Return the cgroup v2 directory for *pid*, or None if not on cgroup v2."""
+    try:
+        with open(f"/proc/{pid}/cgroup") as fh:
+            for line in fh:
+                parts = line.strip().split(":", 2)
+                # cgroup v2 unified hierarchy: single entry "0::<rel_path>"
+                if len(parts) == 3 and parts[0] == "0":
+                    rel = parts[2].lstrip("/")
+                    candidate = f"/sys/fs/cgroup/{rel}" if rel else "/sys/fs/cgroup"
+                    if os.path.isdir(candidate):
+                        return candidate
+    except OSError:
+        pass
+    return None
+
+
 class CgroupV2Monitor:
-    """Reads aggregate CPU time and memory for the current process's cgroup.
+    """Reads aggregate CPU time and memory for one cgroup v2 directory.
 
     Works with cgroup v2 (unified hierarchy) only — the format used by
     systemd on modern Linux.  Instantiating this class is always safe; call
-    ``available`` to test whether the cgroup path was found before using
-    ``sample()``.
+    ``available`` to test whether a valid cgroup path was found/given before
+    using ``sample()``.
+
+    If *cgroup_dir* is provided the directory is used directly (for per-task
+    monitoring of a known scope).  Otherwise the caller's own cgroup is
+    detected from ``/proc/self/cgroup`` (for the global runner-level monitor).
 
     CPU is computed by differentiating the ``usage_usec`` counter in
-    ``cpu.stat``.  The first ``sample()`` call primes the counter and
-    returns ``None`` for cpu_pct; subsequent calls return the average CPU
-    utilisation (as a percentage of one core, same units as psutil's
-    cpu_percent) since the previous call.
+    ``cpu.stat``.  The first ``sample()`` call primes the counter and returns
+    ``None`` for cpu_pct; subsequent calls give the average utilisation
+    (as a percentage of one core, same units as psutil's cpu_percent).
 
-    Memory is read from ``memory.current`` (bytes → MB).  It reflects the
-    total anonymous + file-backed memory of all processes in the cgroup.
+    Memory is read from ``memory.current`` (bytes → MB).  It counts all
+    memory mapped by processes in the cgroup including file-backed pages;
+    shared pages are counted once per cgroup, not per process.  For an
+    apples-to-apples comparison with psutil's PSS metric use the
+    ``memory.stat`` anon field (not implemented here — ``memory.current``
+    is the right proxy for a hard MemoryMax enforcement budget).
     """
 
-    def __init__(self) -> None:
-        self._cgroup_dir: Optional[str] = self._detect()
+    def __init__(self, cgroup_dir: Optional[str] = None) -> None:
+        if cgroup_dir is not None:
+            self._cgroup_dir: Optional[str] = cgroup_dir if os.path.isdir(cgroup_dir) else None
+        else:
+            self._cgroup_dir = _read_cgroup_v2_dir(os.getpid())
         self._last_usage_usec: Optional[int] = None
         self._last_ts: Optional[float] = None
-
-    def _detect(self) -> Optional[str]:
-        try:
-            with open("/proc/self/cgroup") as fh:
-                for line in fh:
-                    parts = line.strip().split(":", 2)
-                    # cgroup v2: single entry "0::<rel_path>"
-                    if len(parts) == 3 and parts[0] == "0":
-                        rel = parts[2].lstrip("/")
-                        candidate = f"/sys/fs/cgroup/{rel}" if rel else "/sys/fs/cgroup"
-                        if os.path.isdir(candidate):
-                            return candidate
-        except OSError:
-            pass
-        return None
 
     @property
     def available(self) -> bool:
@@ -329,10 +344,31 @@ class MonitorThread(threading.Thread):
             log.info("CgroupV2Monitor active at %s", self._cgroup._cgroup_dir)
 
     # ----- registration -----
-    def register(self, tid: int, pid: int, name: str, labels: List[str], start_time: float):
+    def register(
+        self,
+        tid: int,
+        pid: int,
+        name: str,
+        labels: List[str],
+        start_time: float,
+        resolve_cgroup: bool = False,
+    ) -> None:
+        """Register a task for monitoring.
+
+        If *resolve_cgroup* is True the monitor thread will lazily locate the
+        task's cgroup v2 directory by inspecting the first child process of
+        *pid* (which is the systemd-run wrapper when per-task scopes are used).
+        Once resolved a per-task CgroupV2Monitor is created and its readings
+        are stored in the TaskSnapshot alongside the psutil figures.
+        """
         with self._lock:
             self._registered[tid] = {
-                "pid": pid, "name": name, "labels": labels, "start_time": start_time,
+                "pid": pid,
+                "name": name,
+                "labels": labels,
+                "start_time": start_time,
+                "resolve_cgroup": resolve_cgroup,
+                "cgroup_monitor": None,  # filled lazily by _one_pass
             }
 
     def deregister(self, tid: int) -> None:
@@ -396,6 +432,36 @@ class MonitorThread(threading.Thread):
                 pss_mb = prev.pss_mb
                 uss_mb = prev.uss_mb
                 swap_mb = prev.swap_mb
+
+            # --- per-task cgroup monitoring ---
+            # Lazy resolution: when the task runs inside a systemd scope, its
+            # direct child of the systemd-run wrapper PID lands in that scope's
+            # cgroup.  We probe once per pass until the child appears.
+            if info.get("resolve_cgroup") and info.get("cgroup_monitor") is None:
+                try:
+                    p_obj = self.backend._get_or_add(pid)
+                    if p_obj is not None:
+                        children = p_obj.children()
+                        if children:
+                            cgroup_dir = _read_cgroup_v2_dir(children[0].pid)
+                            if cgroup_dir:
+                                info["cgroup_monitor"] = CgroupV2Monitor(cgroup_dir=cgroup_dir)
+                                log.info("Per-task cgroup resolved: tid=%d %s → %s",
+                                         tid, info["name"], cgroup_dir)
+                except Exception:
+                    pass
+
+            cgroup_cpu: Optional[float] = None
+            cgroup_mem: Optional[float] = None
+            cm: Optional[CgroupV2Monitor] = info.get("cgroup_monitor")
+            if cm is not None and cm.available:
+                cgroup_cpu, cgroup_mem = cm.sample()
+                # On the first call cpu is None (no prior baseline); carry
+                # forward None so the consumer can distinguish "not yet" from 0.
+                if cgroup_cpu is None and prev is not None:
+                    cgroup_cpu = prev.cgroup_cpu_pct
+            # -------------------------------------------------------
+
             t_delta_ms = int((now - info["start_time"]) * 1000)
             new_snaps[tid] = TaskSnapshot(
                 tid=tid, name=info["name"],
@@ -404,6 +470,8 @@ class MonitorThread(threading.Thread):
                 nice=nice, labels=info["labels"],
                 disc_mb=self._last_disc_mb,
                 mem_fresh=want_mem,
+                cgroup_cpu_pct=cgroup_cpu,
+                cgroup_mem_mb=cgroup_mem,
             )
 
         with self._lock:

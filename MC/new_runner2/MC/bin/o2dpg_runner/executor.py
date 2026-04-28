@@ -17,6 +17,7 @@ import json
 import logging
 import os
 import platform
+import re
 import signal
 import subprocess
 import sys
@@ -40,6 +41,14 @@ from .alienv import get_alienv_software_environment
 from .cleanup import EarlyFileRemover, archive_task_logs
 
 log = logging.getLogger(__name__)
+
+_UNIT_NAME_RE = re.compile(r"[^a-zA-Z0-9_\-.]")
+
+
+def _unit_name(task_name: str, tid: int) -> str:
+    """Build a valid systemd unit name for a per-task scope."""
+    safe = _UNIT_NAME_RE.sub("-", task_name)
+    return f"task-{safe}-{tid}.scope"
 
 
 @dataclass
@@ -285,7 +294,24 @@ class WorkflowExecutor:
             except OSError as e:
                 log.warning("could not dump taskenv: %s", e)
 
-        p = psutil.Popen(["/bin/bash", "-c", cmd], cwd=workdir, env=env)
+        # When the runner is inside a systemd slice, wrap each task in its own
+        # child scope so per-task cgroup metrics are available alongside psutil.
+        slice_name = self.cfg.systemd_slice_name
+        use_scope = self.cfg.in_systemd_slice and bool(slice_name)
+        if use_scope:
+            systemd_slice = (
+                slice_name if slice_name.endswith(".slice") else f"{slice_name}.slice"
+            )
+            unit = _unit_name(task["name"], tid)
+            launch_argv = [
+                "systemd-run", "--user", "--scope", "--collect",
+                f"--unit={unit}", f"--slice={systemd_slice}",
+                "--", "/bin/bash", "-c", cmd,
+            ]
+        else:
+            launch_argv = ["/bin/bash", "-c", cmd]
+
+        p = psutil.Popen(launch_argv, cwd=workdir, env=env)
         try:
             p.nice(nice)
         except (psutil.NoSuchProcess, psutil.AccessDenied):
@@ -299,7 +325,8 @@ class WorkflowExecutor:
         )
         self.task_runtime[tid] = rt
         self.monitor.register(
-            tid, p.pid, task["name"], task.get("labels", []) or [], rt.start_time
+            tid, p.pid, task["name"], task.get("labels", []) or [], rt.start_time,
+            resolve_cgroup=use_scope,
         )
         return p
 
@@ -371,6 +398,9 @@ class WorkflowExecutor:
                 "cpu": snap.cpu_pct, "uss": snap.uss_mb, "pss": snap.pss_mb,
                 "nice": snap.nice, "swap": snap.swap_mb,
                 "label": snap.labels, "disc": snap.disc_mb,
+                # cgroup-based readings for comparison with psutil (None when
+                # no per-task scope is active)
+                "cgroup_cpu": snap.cgroup_cpu_pct, "cgroup_mem": snap.cgroup_mem_mb,
             })
 
         # cgroup-aggregate totals (present only when inside a systemd slice or
