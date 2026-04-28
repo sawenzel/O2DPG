@@ -98,7 +98,7 @@ class WorkflowExecutor:
 
         # apply update-resources (before building resource manager)
         if config.update_resources:
-            update_resource_estimates(workflow, config.update_resources)
+            update_resource_estimates(workflow, config.update_resources, logger=action_logger)
 
         # resource manager
         self.rm = ResourceManager(

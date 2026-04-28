@@ -227,38 +227,72 @@ def build_workflow(
     return wf
 
 
-def update_resource_estimates(workflow: Workflow, resource_json_path: str) -> None:
+def update_resource_estimates(workflow: Workflow, resource_json_path: str, logger=None) -> None:
     """Apply learned resource estimates from a JSON file.
 
     The JSON is produced by o2dpg_sim_metrics.py json-stat and is keyed on
     the "global" task name (i.e. with the _<timeframe> suffix stripped).
+
+    MEM is taken from pss.max (peak proportional set size).
+    CPU is taken from cpu.mean (average cores used during the task).
+
+    Note on relative_cpu: the workflow JSON carries a relative_cpu field
+    that historically scaled a "max" CPU estimate down to an "expected"
+    usage.  When injecting *measured* cpu.mean values that scaling must NOT
+    be applied again — the measurement already reflects actual usage.
+    relative_cpu remains untouched and continues to be used by the dynamic-
+    resources sampler (resources.py) for sibling reassignment, which is
+    correct behaviour: the sampler scales a freshly-observed aggregate back
+    to an expected per-task assignment.
     """
+    _log = logger if logger is not None else log
+    _log.info("Applying learned resource estimates from: %s", resource_json_path)
+
     with open(resource_json_path) as fp:
         resource_dict = json.load(fp)
+
+    # Remove the metadata key so task lookup doesn't match it.
+    resource_dict.pop("count", None)
+
+    n_stages = len(workflow.stages)
+    n_updated = 0
+    missing_base_names: set = set()
 
     for task in workflow.stages:
         tf = task.get("timeframe", -1)
         name = task["name"]
-        if tf >= 1:
-            global_name = "_".join(name.split("_")[:-1])
-        else:
-            global_name = name
+        global_name = "_".join(name.split("_")[:-1]) if tf >= 1 else name
 
         if global_name not in resource_dict:
+            missing_base_names.add(global_name)
             continue
+
         new_res = resource_dict[global_name]
+        task_updated = False
 
         new_mem = new_res.get("pss", {}).get("max")
         if new_mem is not None:
-            old = task["resources"]["mem"]
-            log.info("Updating MEM estimate for %s: %s -> %s", name, old, new_mem)
+            old_mem = task["resources"]["mem"]
             task["resources"]["mem"] = new_mem
+            _log.info("  MEM  %-40s  %.1f MB -> %.1f MB", name, float(old_mem), new_mem)
+            task_updated = True
 
         new_cpu = new_res.get("cpu", {}).get("mean")
         if new_cpu is not None:
-            old = task["resources"]["cpu"]
-            rel = task["resources"].get("relative_cpu")
-            if rel is not None:
-                new_cpu *= rel
-            log.info("Updating CPU estimate for %s: %s -> %s", name, old, new_cpu)
+            old_cpu = task["resources"]["cpu"]
+            # Do NOT apply relative_cpu scaling here.  The measured cpu.mean
+            # is already the observed average core usage; scaling it down by
+            # relative_cpu would cause the scheduler to underbook the task.
             task["resources"]["cpu"] = new_cpu
+            _log.info("  CPU  %-40s  %.3f cores -> %.3f cores", name, float(old_cpu), new_cpu)
+            task_updated = True
+
+        if task_updated:
+            n_updated += 1
+
+    if missing_base_names:
+        _log.info("  No learned data for: %s", ", ".join(sorted(missing_base_names)))
+    _log.info(
+        "Resource update done: %d/%d task stages updated (%d base name(s) not in learned data).",
+        n_updated, n_stages, len(missing_base_names),
+    )

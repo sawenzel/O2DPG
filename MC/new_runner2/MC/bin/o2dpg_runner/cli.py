@@ -194,6 +194,80 @@ def _parse_systemd_run_spec(spec: str) -> Tuple[Optional[str], Optional[str], st
     return cpu_quota, mem, slice_name
 
 
+def _parse_mem_to_bytes(mem_str: str) -> Optional[int]:
+    """Convert a memory size string (e.g. "16G", "512M") to bytes."""
+    suffixes = {"K": 1024, "M": 1024**2, "G": 1024**3, "T": 1024**4}
+    s = mem_str.strip()
+    if s and s[-1].upper() in suffixes:
+        try:
+            return int(float(s[:-1]) * suffixes[s[-1].upper()])
+        except ValueError:
+            pass
+    try:
+        return int(s)
+    except ValueError:
+        return None
+
+
+def _apply_slice_cgroup_limits(
+    cpu_quota: Optional[str],
+    mem_str: Optional[str],
+    logger: logging.Logger,
+) -> None:
+    """Write resource limits to the parent slice's cgroup directory.
+
+    Called after re-exec inside the slice.  The runner's own scope lives at
+    .../kaz1.slice/o2dpg-runner-<pid>.scope/; one dirname() up is the slice
+    that covers both the runner and all sibling per-task scopes.
+
+    This is the portable fallback for systemd < 246 which lacks
+    --slice-property.  Writing directly to cpu.max / memory.max works on
+    any cgroup v2 system where the user owns the cgroup.
+    """
+    cgroup_rel: Optional[str] = None
+    try:
+        with open("/proc/self/cgroup") as fh:
+            for line in fh:
+                parts = line.strip().split(":", 2)
+                if len(parts) == 3 and parts[0] == "0":
+                    cgroup_rel = parts[2].lstrip("/")
+                    break
+    except OSError:
+        pass
+
+    if not cgroup_rel:
+        logger.warning("Cannot determine cgroup path; slice limits not applied.")
+        return
+
+    scope_dir = f"/sys/fs/cgroup/{cgroup_rel}"
+    slice_dir = os.path.dirname(scope_dir)
+
+    if cpu_quota:
+        pct = float(cpu_quota.rstrip("%"))
+        # cgroup cpu.max format: "<quota_usec> <period_usec>"
+        # 100% = 1 core = 100000 usec per 100000 usec period
+        quota_usec = int(pct * 1000)
+        cpu_max = os.path.join(slice_dir, "cpu.max")
+        try:
+            with open(cpu_max, "w") as fh:
+                fh.write(f"{quota_usec} 100000\n")
+            logger.info("Slice CPUQuota=%s applied → %s", cpu_quota, cpu_max)
+        except OSError as e:
+            logger.warning("Could not set CPUQuota on slice (%s): %s", cpu_max, e)
+
+    if mem_str:
+        mem_bytes = _parse_mem_to_bytes(mem_str)
+        if mem_bytes is not None:
+            mem_max = os.path.join(slice_dir, "memory.max")
+            try:
+                with open(mem_max, "w") as fh:
+                    fh.write(f"{mem_bytes}\n")
+                logger.info("Slice MemoryMax=%s (%d bytes) applied → %s",
+                            mem_str, mem_bytes, mem_max)
+            except OSError as e:
+                logger.warning("Could not set MemoryMax on slice (%s): %s", mem_max, e)
+
+
 def _maybe_reexec_in_slice(ns: argparse.Namespace) -> None:
     """If --systemd-run is set and we are not already in the slice, re-exec.
 
@@ -216,7 +290,7 @@ def _maybe_reexec_in_slice(ns: argparse.Namespace) -> None:
         return
 
     try:
-        cpu_quota, mem, slice_name = _parse_systemd_run_spec(spec)
+        _, _, slice_name = _parse_systemd_run_spec(spec)
     except ValueError as e:
         print(f"Error in --systemd-run spec: {e}", file=sys.stderr)
         sys.exit(1)
@@ -226,10 +300,11 @@ def _maybe_reexec_in_slice(ns: argparse.Namespace) -> None:
     unit_name = f"o2dpg-runner-{os.getpid()}.scope"
     cmd = ["systemd-run", "--user", "--scope", "--collect",
            f"--unit={unit_name}", f"--slice={systemd_slice}"]
-    if cpu_quota:
-        cmd.append(f"--property=CPUQuota={cpu_quota}")
-    if mem:
-        cmd.append(f"--property=MemoryMax={mem}")
+    # Resource limits are NOT passed here; they are written directly to the
+    # slice cgroup after re-exec via _apply_slice_cgroup_limits().
+    # --property=CPUQuota applies only to the scope (runner), not to the
+    # sibling task scopes.  --slice-property would be correct but requires
+    # systemd ≥ 246.  Direct cgroup writes work on all versions.
     cmd += ["--", sys.executable] + sys.argv
 
     os.environ[_IN_SLICE_ENV] = "1"
@@ -301,6 +376,15 @@ def main(argv=None) -> int:
     _h.setFormatter(_FORMATTER)
     pkg_log.addHandler(_h)
 
+    # Apply slice-level cgroup resource limits now that we are inside the
+    # slice and the action logger is ready to record the outcome.
+    if cfg.in_systemd_slice and cfg.systemd_run_spec:
+        try:
+            cpu_quota, mem_str, _ = _parse_systemd_run_spec(cfg.systemd_run_spec)
+            _apply_slice_cgroup_limits(cpu_quota, mem_str, action_logger)
+        except Exception as e:
+            action_logger.warning("Could not apply slice cgroup limits: %s", e)
+
     # record meta to the metric log (mirrors prototype)
     raw = load_json(cfg.workflowfile)
     meta = raw.get("meta", {}) if isinstance(raw, dict) else {}
@@ -318,6 +402,7 @@ def main(argv=None) -> int:
         "cache_policy": cfg.cache_policy,
         "systemd_run_spec": cfg.systemd_run_spec,
         "in_systemd_slice": cfg.in_systemd_slice,
+        "monitor_interval_cpu": cfg.monitor_interval_cpu,
     })
     metric_logger.info(meta)
 
