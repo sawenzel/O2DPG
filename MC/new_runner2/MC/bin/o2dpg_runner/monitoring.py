@@ -311,6 +311,7 @@ class MonitorThread(threading.Thread):
         backend: Optional[PsutilBackend] = None,
         monitor_disc: bool = False,
         disc_path: str = ".",
+        global_cgroup_dir: Optional[str] = None,
     ):
         super().__init__(daemon=True, name="o2dpg-monitor")
         self.cpu_interval = cpu_interval
@@ -333,15 +334,17 @@ class MonitorThread(threading.Thread):
         # the "iter" field reflects wall-clock ticks like the prototype did.
         self.tick: int = 0
 
-        # Opportunistic cgroup v2 global monitor.  Active whenever the runner
-        # is inside a cgroup (e.g. after --systemd-run re-exec), but harmless
-        # otherwise.  Written only from the monitor thread; read from the
-        # executor thread — GIL makes bare float/None assignment atomic.
-        self._cgroup = CgroupV2Monitor()
+        # Opportunistic cgroup v2 global monitor.  When the runner is inside a
+        # systemd slice the caller should pass the *slice* directory (parent of
+        # the runner's own scope) so the global numbers cover all sibling task
+        # scopes too.  Falls back to the runner's own cgroup when not given.
+        # Written only from the monitor thread; read from the executor thread —
+        # GIL makes bare float/None assignment atomic.
+        self._cgroup = CgroupV2Monitor(cgroup_dir=global_cgroup_dir)
         self.global_cpu_pct: Optional[float] = None  # cgroup-aggregate CPU %
         self.global_mem_mb: Optional[float] = None   # cgroup-aggregate memory MB
         if self._cgroup.available:
-            log.info("CgroupV2Monitor active at %s", self._cgroup._cgroup_dir)
+            log.info("CgroupV2Monitor global active at %s", self._cgroup._cgroup_dir)
 
     # ----- registration -----
     def register(
@@ -456,10 +459,11 @@ class MonitorThread(threading.Thread):
             cm: Optional[CgroupV2Monitor] = info.get("cgroup_monitor")
             if cm is not None and cm.available:
                 cgroup_cpu, cgroup_mem = cm.sample()
-                # On the first call cpu is None (no prior baseline); carry
-                # forward None so the consumer can distinguish "not yet" from 0.
-                if cgroup_cpu is None and prev is not None:
-                    cgroup_cpu = prev.cgroup_cpu_pct
+                # cgroup_cpu is None on the very first sample() call (no prior
+                # baseline yet) and whenever the scope's cpu.stat is unreadable
+                # (e.g. after --collect removes the finished scope).  In both
+                # cases we leave it as None rather than carrying forward a stale
+                # value — one tick with None is preferable to a wrong number.
             # -------------------------------------------------------
 
             t_delta_ms = int((now - info["start_time"]) * 1000)

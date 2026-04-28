@@ -21,6 +21,7 @@ import re
 import signal
 import subprocess
 import sys
+import threading
 import time
 import traceback
 from dataclasses import dataclass, field
@@ -32,7 +33,7 @@ from .config import RunnerConfig
 from .workflow import Workflow, update_resource_estimates
 from .graph import descendants, longest_path_length, kahn_topological_order
 from .resources import ResourceManager, ResourceLimitExceeded
-from .monitoring import MonitorThread, PsutilBackend
+from .monitoring import MonitorThread, PsutilBackend, _read_cgroup_v2_dir
 from .scheduler import get_policy
 from .scheduler.base import SchedulerState
 from .scheduler.timeframe import TimeframeFirstPolicy
@@ -49,6 +50,26 @@ def _unit_name(task_name: str, tid: int) -> str:
     """Build a valid systemd unit name for a per-task scope."""
     safe = _UNIT_NAME_RE.sub("-", task_name)
     return f"task-{safe}-{tid}.scope"
+
+
+def _start_stderr_drainer(pipe, logger: logging.Logger, tag: str) -> threading.Thread:
+    """Drain *pipe* line-by-line in a daemon thread, forwarding to *logger*.
+
+    Used to capture systemd-run's own informational messages (e.g. "Running
+    as unit: ...") and route them to the action log instead of the terminal.
+    The thread exits naturally when the pipe reaches EOF (process finished).
+    """
+    def _run() -> None:
+        try:
+            for raw in pipe:
+                line = raw.rstrip() if isinstance(raw, str) else raw.rstrip().decode(errors="replace")
+                if line:
+                    logger.info("[systemd] %s: %s", tag, line)
+        except Exception:
+            pass
+    t = threading.Thread(target=_run, daemon=True, name=f"stderr-{tag}")
+    t.start()
+    return t
 
 
 @dataclass
@@ -129,6 +150,21 @@ class WorkflowExecutor:
         self.alternative_envs: Dict[int, Dict[str, str]] = {}
         self._init_alternative_envs()
 
+        # Compute the global cgroup directory for the aggregate monitor.
+        # When running inside a systemd slice the runner's own scope is a leaf
+        # node (e.g. o2dpg.slice/o2dpg-runner-<pid>.scope/) and task scopes are
+        # siblings.  We need the *parent* slice directory so cpu.stat and
+        # memory.current cover the runner + all task scopes.  Outside a slice
+        # the runner and its children share one cgroup, so the runner's own dir
+        # is correct.
+        _runner_cgroup = _read_cgroup_v2_dir(os.getpid())
+        if config.in_systemd_slice and _runner_cgroup:
+            _global_cgroup = os.path.dirname(_runner_cgroup)
+            if not os.path.isdir(_global_cgroup):
+                _global_cgroup = _runner_cgroup  # safety fallback
+        else:
+            _global_cgroup = _runner_cgroup
+
         # monitor
         self.monitor = MonitorThread(
             cpu_interval=config.monitor_interval_cpu,
@@ -136,6 +172,7 @@ class WorkflowExecutor:
             backend=PsutilBackend(),
             monitor_disc=bool(os.getenv("MONITOR_DISC_USAGE")),
             disc_path=os.getcwd(),
+            global_cgroup_dir=_global_cgroup,
         )
 
         # process tracking
@@ -162,6 +199,7 @@ class WorkflowExecutor:
 
         self.start_time: float = 0.0
         self.scheduling_iteration = 0
+        self._last_metric_tick: int = -1  # prevents duplicate metric rows per tick
 
         # signals
         signal.signal(signal.SIGINT, self._sighandler)
@@ -305,13 +343,15 @@ class WorkflowExecutor:
             unit = _unit_name(task["name"], tid)
             launch_argv = [
                 "systemd-run", "--user", "--scope", "--collect",
+                "--expand-environment=no",  # suppress the $VAR warning; bash handles expansion
                 f"--unit={unit}", f"--slice={systemd_slice}",
                 "--", "/bin/bash", "-c", cmd,
             ]
+            p = psutil.Popen(launch_argv, cwd=workdir, env=env, stderr=subprocess.PIPE)
+            _start_stderr_drainer(p.stderr, self.actionlog, task["name"])
         else:
             launch_argv = ["/bin/bash", "-c", cmd]
-
-        p = psutil.Popen(launch_argv, cwd=workdir, env=env)
+            p = psutil.Popen(launch_argv, cwd=workdir, env=env)
         try:
             p.nice(nice)
         except (psutil.NoSuchProcess, psutil.AccessDenied):
@@ -388,31 +428,36 @@ class WorkflowExecutor:
         if not self.process_list:
             return False
 
-        # feed monitor samples into resource manager
+        # feed monitor samples into resource manager; emit metric rows only
+        # once per monitor tick (wait_for_any is polled more often than the
+        # monitor fires, so the same tick value would appear multiple times)
         snapshots = self.monitor.latest()
         tick = self.monitor.tick
         for tid, snap in snapshots.items():
             self.rm.add_monitored(tid, snap.t_delta_ms, snap.cpu_pct / 100.0, snap.pss_mb)
-            self.metriclog.info({
-                "iter": tick, "name": snap.name,
-                "cpu": snap.cpu_pct, "uss": snap.uss_mb, "pss": snap.pss_mb,
-                "nice": snap.nice, "swap": snap.swap_mb,
-                "label": snap.labels, "disc": snap.disc_mb,
-                # cgroup-based readings for comparison with psutil (None when
-                # no per-task scope is active)
-                "cgroup_cpu": snap.cgroup_cpu_pct, "cgroup_mem": snap.cgroup_mem_mb,
-            })
 
-        # cgroup-aggregate totals (present only when inside a systemd slice or
-        # any other cgroup v2 hierarchy; absent otherwise)
-        g_cpu = self.monitor.global_cpu_pct
-        g_mem = self.monitor.global_mem_mb
-        if g_cpu is not None or g_mem is not None:
-            self.metriclog.info({
-                "iter": tick, "name": "__cgroup_global__",
-                "cpu": g_cpu, "uss": None, "pss": g_mem,
-                "nice": 0, "swap": None, "label": [], "disc": -1,
-            })
+        if tick != self._last_metric_tick:
+            self._last_metric_tick = tick
+            for tid, snap in snapshots.items():
+                self.metriclog.info({
+                    "iter": tick, "name": snap.name,
+                    "cpu": snap.cpu_pct, "uss": snap.uss_mb, "pss": snap.pss_mb,
+                    "nice": snap.nice, "swap": snap.swap_mb,
+                    "label": snap.labels, "disc": snap.disc_mb,
+                    # cgroup-based readings for comparison with psutil (None when
+                    # no per-task scope is active)
+                    "cgroup_cpu": snap.cgroup_cpu_pct, "cgroup_mem": snap.cgroup_mem_mb,
+                })
+
+            # cgroup-aggregate slice totals
+            g_cpu = self.monitor.global_cpu_pct
+            g_mem = self.monitor.global_mem_mb
+            if g_cpu is not None or g_mem is not None:
+                self.metriclog.info({
+                    "iter": tick, "name": "__cgroup_global__",
+                    "cpu": g_cpu, "uss": None, "pss": g_mem,
+                    "nice": 0, "swap": None, "label": [], "disc": -1,
+                })
 
         # check for completions
         newly_done: List[Tuple[int, subprocess.Popen, int]] = []
