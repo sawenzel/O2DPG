@@ -985,7 +985,9 @@ for tf in range(1, NTIMEFRAMES + 1):
    SGNtask=createTask(name='sgnsim_'+str(tf), needs=signalneeds, tf=tf, cwd='tf'+str(tf), lab=["GEANT"],
                       relative_cpu=7/8, n_workers=NWORKERS_TF, mem=str(sgnmem))
    sgncmdbase = '${O2_ROOT}/bin/o2-sim -e ' + str(SIMENGINE) + ' '  + str(SKIPMODULES) + ' -n ' + str(NSIGEVENTS) + ' --seed ' + str(TFSEED)      \
-              + ' --field ccdb -j ' + str(NWORKERS_TF) + ' ' + str(CONFKEY) + ' ' + str(INIFILE) + ' -o ' + signalprefix + ' ' + embeddinto       \
+              + ' --field ccdb '\
+              + f"-j ${{O2DPG_DYNAMIC_NWORKER_OVERWRITE:-{NWORKERS_TF}}} "\
+              + str(CONFKEY) + ' ' + str(INIFILE) + ' -o ' + signalprefix + ' ' + embeddinto       \
               + ' --detectorList ' + args.detectorList                                                                                            \
               + ('', ' --timestamp ' + str(args.timestamp))[args.timestamp!=-1] + ' --run ' + str(args.run)
    if sep_event_mode:

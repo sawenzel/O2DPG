@@ -24,6 +24,7 @@ from __future__ import annotations
 import copy
 import json
 import logging
+import math
 import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -285,6 +286,22 @@ def update_resource_estimates(workflow: Workflow, resource_json_path: str, logge
             # relative_cpu would cause the scheduler to underbook the task.
             task["resources"]["cpu"] = new_cpu
             _log.info("  CPU  %-40s  %.3f cores -> %.3f cores", name, float(old_cpu), new_cpu)
+            task_updated = True
+
+        # Set O2DPG_DYNAMIC_NWORKER_OVERWRITE so tasks that use
+        # ${O2DPG_DYNAMIC_NWORKER_OVERWRITE:-N} in their command string
+        # pick up the learned worker count automatically.
+        # Use ceil(cpu.max) — the observed peak — to retain headroom for
+        # bursts.  ceil(cpu.mean) is the more aggressive alternative.
+        cpu_max = new_res.get("cpu", {}).get("max")
+        if cpu_max is not None:
+            n_workers = math.ceil(max(1.0, cpu_max))
+            task.setdefault("env", {})
+            if task["env"] is None:
+                task["env"] = {}
+            task["env"]["O2DPG_DYNAMIC_NWORKER_OVERWRITE"] = str(n_workers)
+            _log.info("  NWORKERS %-40s  -> %d (ceil of cpu.max=%.2f)",
+                      name, n_workers, cpu_max)
             task_updated = True
 
         if task_updated:
