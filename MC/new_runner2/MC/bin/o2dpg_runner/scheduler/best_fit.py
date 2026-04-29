@@ -4,11 +4,18 @@ Instead of following the ordered list linearly, it picks the candidate
 that maximizes a fitness score given the current remaining budget.
 Iterates until nothing fits. The backfill pass uses the same idea.
 
-Fitness score: descendants-per-resource-used, so heavy-but-valuable tasks
-still win, but not at the cost of blocking many smaller ones.
+Fitness = critical_path_weight * packing_tightness, where:
+  - critical_path_weight is state.critical_path[tid] — remaining walltime
+    on the longest path (walltime-weighted when learned data is available,
+    cpu-weighted otherwise).  This is the "hybrid CP + packing" heuristic:
+    prefer tasks on the longest critical path, but among those that fit
+    similarly, pick the one that uses capacity most tightly.
+  - packing_tightness = 1 / max(cpu_ratio, mem_ratio) — dominant-resource
+    formulation.  The resource that is most constrained (cpu or mem)
+    determines the score; neither is suppressed as in the old 1/1000 weight.
 
-Default order is same as critical-path (good baseline) but pick_submittable
-re-ranks on the fly.
+Default ordering is still critical-path (good baseline); pick_submittable
+re-ranks on the fly within the fitting set.
 """
 
 from __future__ import annotations
@@ -40,11 +47,16 @@ class BestFitBackfillPolicy(SchedulerPolicy):
         mem_ratio = mem_free / m
         if cpu_ratio < 1 or mem_ratio < 1:
             return -1.0
-        # Prefer tasks that tightly fit (use capacity well) AND have many
-        # descendants (to unblock more of the DAG).
-        tightness = 1.0 / (cpu_ratio + mem_ratio / 1000.0)
-        desc = state.descendants_count[res.tid] if state.descendants_count else 0
-        return (desc + 1) * tightness
+        # Dominant-resource tightness: scored by whichever resource is more
+        # constrained relative to free capacity.  1/max gives higher scores
+        # to tasks that use the scarce resource more fully.
+        tightness = 1.0 / max(cpu_ratio, mem_ratio)
+        # CP weight: remaining walltime on the longest path from this task.
+        # Rewards placing tasks that unblock the most remaining work first.
+        # Falls back to descendants_count+1 when no critical_path available.
+        cp = state.critical_path[res.tid] if state.critical_path else 0.0
+        cp_weight = cp if cp > 0 else (state.descendants_count[res.tid] + 1 if state.descendants_count else 1)
+        return cp_weight * tightness
 
     def pick_submittable(
         self, ordered: List[int], rm: ResourceManager

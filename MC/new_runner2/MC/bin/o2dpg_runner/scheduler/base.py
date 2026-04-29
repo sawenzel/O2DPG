@@ -30,9 +30,10 @@ class SchedulerState:
     # Static data
     timeframe_of: List[int] = field(default_factory=list)   # tid -> timeframe
     descendants_count: List[int] = field(default_factory=list)  # |desc(tid)|
-    critical_path: List[float] = field(default_factory=list)   # from graph.longest_path_length
+    critical_path: List[float] = field(default_factory=list)   # longest_path_length weighted by walltime (or cpu fallback)
     task_cpu: List[float] = field(default_factory=list)
     task_mem: List[float] = field(default_factory=list)
+    task_walltime: List[float] = field(default_factory=list)  # per-task walltime [s]; 0 if unknown
     # Derived weight tuples (static, cached by executor)
     #   timeframe_weight[tid] = (timeframe, -num_descendants)
     timeframe_weight: List[Tuple[int, int]] = field(default_factory=list)

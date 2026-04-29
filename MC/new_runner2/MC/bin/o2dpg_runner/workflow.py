@@ -315,6 +315,12 @@ def update_resource_estimates(
         new_res = resource_dict[global_name]
         task_updated = False
 
+        walltime = new_res.get("lifetime", {}).get("mean")
+        if walltime is not None and float(walltime) > 0:
+            task["resources"]["walltime"] = float(walltime)
+            _log.info("  WALLTIME %-40s  %.1f s", name, float(walltime))
+            task_updated = True
+
         new_mem = new_res.get("pss", {}).get("max")
         if new_mem is not None:
             old_mem = task["resources"]["mem"]

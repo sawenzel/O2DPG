@@ -1,12 +1,14 @@
 """Critical-path-first scheduler.
 
-Sorts candidates by longest remaining path to any leaf, weighted by
-per-task CPU*assumed_walltime estimate. Identical submit discipline as
-TimeframeFirstPolicy without should_break (no reason to block light
-tasks once we've committed to CP prioritization).
+Sorts candidates by state.critical_path[tid] — the longest remaining
+path weight to any leaf.  The weight is walltime [s] when --update-resources
+has been used to inject learned lifetime data (resources.walltime per task);
+it falls back to cpu cores otherwise.  Both give a valid makespan proxy;
+the walltime variant is strictly more accurate for multithreaded tasks.
 
-This is a standard HEFT-style heuristic. Useful when resource estimates
-are learned (--update-resources) and therefore reasonably accurate.
+Submit discipline: scan ordered list, submit everything that fits at default
+nice, then do a second backfill pass at elevated nice.  No should_break —
+there is no reason to stop scanning once we have committed to CP ordering.
 """
 
 from __future__ import annotations

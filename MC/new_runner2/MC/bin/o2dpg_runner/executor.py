@@ -231,13 +231,30 @@ class WorkflowExecutor:
         timeframe_of = [t.get("timeframe", -1) for t in self.wf.stages]
         tf_weight = [(timeframe_of[t], desc_counts[t]) for t in range(n)]
 
-        # critical path in "work units" = cpu * mem-weighted-walltime-proxy.
-        # Without measured walltimes, use cpu*1 as the weight (i.e. longest
-        # CPU-weighted chain). Stable and deterministic.
         cpu = [float(t.get("resources", {}).get("cpu", 1.0)) for t in self.wf.stages]
         mem = [float(t.get("resources", {}).get("mem", 0.0)) for t in self.wf.stages]
+
+        # Per-task walltime [s] from learned resources (resources.walltime set
+        # by update_resource_estimates when --update-resources is given).
+        # Fall back to cpu as a proxy so behaviour is unchanged without
+        # learned data.
+        walltime = [
+            float(t.get("resources", {}).get("walltime") or cpu[i])
+            for i, t in enumerate(self.wf.stages)
+        ]
+        has_walltime = any(
+            t.get("resources", {}).get("walltime") for t in self.wf.stages
+        )
+
+        # Critical path: longest remaining *wall time* to any leaf.
+        # Using walltime as the node weight gives a true makespan estimate;
+        # using cpu (the fallback) preserves the original heuristic.
+        cp_weight = walltime if has_walltime else cpu
         topo = kahn_topological_order(n, self.wf.forward_adj, self.wf.indegree)
-        cp = longest_path_length(self.wf.forward_adj, topo, cpu)
+        cp = longest_path_length(self.wf.forward_adj, topo, cp_weight)
+
+        if has_walltime:
+            self.actionlog.info("Critical path weighted by learned walltime [s]")
 
         # self-log weights (matches prototype's informational logging)
         for tid in range(n):
@@ -249,6 +266,7 @@ class WorkflowExecutor:
             critical_path=cp,
             task_cpu=cpu,
             task_mem=mem,
+            task_walltime=walltime,
             timeframe_weight=tf_weight,
         )
 
