@@ -228,7 +228,43 @@ def build_workflow(
     return wf
 
 
-def update_resource_estimates(workflow: Workflow, resource_json_path: str, logger=None) -> None:
+def _optimal_n_workers(
+    cpu_limit: float,
+    n_instances: int,
+    learned_cpu_max: float,
+    learned_cpu_mean: float,
+) -> int:
+    """Return the worker count that maximises CPU utilisation for this task type.
+
+    With N timeframe instances of a task and a global cpu_limit, the number
+    that can run simultaneously is k = min(N, floor(cpu_limit / n_workers)).
+    Utilisation is k * n_workers.  We search [1, upper] for the n_workers
+    that maximises utilisation; on ties we prefer the smaller value (more
+    parallelism, shorter critical path).
+
+    The upper bound is min(cpu_limit, ceil(cpu.max)) — never give a task
+    more workers than it was actually observed to use, and never more than
+    the total budget.
+    """
+    upper = min(int(cpu_limit), math.ceil(max(1.0, learned_cpu_max)))
+    # Sensible starting point: the mean usage rounded up.
+    best_n = max(1, math.ceil(learned_cpu_mean))
+    best_util = 0
+    for n in range(1, upper + 1):
+        k = min(n_instances, int(cpu_limit) // n)
+        util = k * n
+        if util > best_util:   # strict: first (smallest) n wins on equal util
+            best_util = util
+            best_n = n
+    return best_n
+
+
+def update_resource_estimates(
+    workflow: Workflow,
+    resource_json_path: str,
+    logger=None,
+    cpu_limit: float = 0.0,
+) -> None:
     """Apply learned resource estimates from a JSON file.
 
     The JSON is produced by o2dpg_sim_metrics.py json-stat and is keyed on
@@ -259,6 +295,14 @@ def update_resource_estimates(workflow: Workflow, resource_json_path: str, logge
     n_updated = 0
     missing_base_names: set = set()
 
+    # Count how many stages share each base name (needed for the worker
+    # packing optimisation: more instances → smaller optimal n_workers).
+    base_name_count: Dict[str, int] = {}
+    for task in workflow.stages:
+        tf = task.get("timeframe", -1)
+        bn = "_".join(task["name"].split("_")[:-1]) if tf >= 1 else task["name"]
+        base_name_count[bn] = base_name_count.get(bn, 0) + 1
+
     for task in workflow.stages:
         tf = task.get("timeframe", -1)
         name = task["name"]
@@ -288,20 +332,27 @@ def update_resource_estimates(workflow: Workflow, resource_json_path: str, logge
             _log.info("  CPU  %-40s  %.3f cores -> %.3f cores", name, float(old_cpu), new_cpu)
             task_updated = True
 
-        # Set O2DPG_DYNAMIC_NWORKER_OVERWRITE so tasks that use
-        # ${O2DPG_DYNAMIC_NWORKER_OVERWRITE:-N} in their command string
-        # pick up the learned worker count automatically.
-        # Use ceil(cpu.max) — the observed peak — to retain headroom for
-        # bursts.  ceil(cpu.mean) is the more aggressive alternative.
+        # Set O2DPG_DYNAMIC_NWORKER_OVERWRITE so tasks using
+        # ${O2DPG_DYNAMIC_NWORKER_OVERWRITE:-N} pick up the learned count.
+        # The value is chosen to maximise CPU filling across all parallel
+        # instances of this task type (see _optimal_n_workers for the math).
         cpu_max = new_res.get("cpu", {}).get("max")
-        if cpu_max is not None:
-            n_workers = math.ceil(max(1.0, cpu_max))
-            task.setdefault("env", {})
-            if task["env"] is None:
+        cpu_mean = new_res.get("cpu", {}).get("mean")
+        if (cpu_max is not None and cpu_mean is not None
+                and "O2DPG_DYNAMIC_NWORKER_OVERWRITE" in task.get("cmd", "")):
+            n_instances = base_name_count.get(global_name, 1)
+            effective_limit = cpu_limit if cpu_limit > 0 else max(1.0, cpu_max)
+            n_workers = _optimal_n_workers(
+                effective_limit, n_instances, cpu_max, cpu_mean
+            )
+            if not isinstance(task.get("env"), dict):
                 task["env"] = {}
             task["env"]["O2DPG_DYNAMIC_NWORKER_OVERWRITE"] = str(n_workers)
-            _log.info("  NWORKERS %-40s  -> %d (ceil of cpu.max=%.2f)",
-                      name, n_workers, cpu_max)
+            _log.info(
+                "  NWORKERS %-40s  -> %d  (N=%d, cpu_limit=%.0f, "
+                "cpu.max=%.2f, cpu.mean=%.2f)",
+                name, n_workers, n_instances, effective_limit, cpu_max, cpu_mean,
+            )
             task_updated = True
 
         if task_updated:
