@@ -1,0 +1,521 @@
+#!/usr/bin/env python3
+"""Discrete-event simulator for the O2DPG workflow scheduler.
+
+Loads a workflow (and optionally applies learned resources), then
+simulates scheduling under one or more policies in microseconds —
+no processes are spawned.
+
+Assumptions (matching a kernel-enforced hard CPU limit):
+  - No nice / backfill tier: all tasks are submitted at the default
+    nice level against a single hard CPU budget.
+  - Memory is also a hard limit.
+  - Tasks run for exactly their `resources.walltime` seconds (set by
+    --update-resources).  If walltime is absent, cpu * --walltime-per-core
+    is used as a proxy.
+  - Task parallelism is limited only by cpu_limit and mem_limit, not
+    by --maxjobs (the simulator sets the process cap to infinity).
+
+Usage examples
+--------------
+Compare all three policies with learned resources:
+
+    o2dpg_schedule_simulator.py \\
+        -f workflow.json \\
+        --update-resources learned.json \\
+        --cpu-limit 8 --mem-limit 16384 \\
+        --policies timeframe critical-path best-fit
+
+Single policy, verbose per-task schedule:
+
+    o2dpg_schedule_simulator.py \\
+        -f workflow.json --update-resources learned.json \\
+        --cpu-limit 8 --mem-limit 16384 \\
+        --policies critical-path --verbose
+
+JSON output for downstream analysis:
+
+    o2dpg_schedule_simulator.py ... --output sim.json
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import os
+import random
+import statistics
+import sys
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Set, Tuple
+
+_here = os.path.dirname(os.path.abspath(__file__))
+if _here not in sys.path:
+    sys.path.insert(0, _here)
+
+from o2dpg_runner.workflow import build_workflow, load_json, update_resource_estimates
+from o2dpg_runner.resources import ResourceManager, ResourceLimitExceeded
+from o2dpg_runner.scheduler import get_policy
+from o2dpg_runner.scheduler.base import SchedulerState
+from o2dpg_runner.scheduler.timeframe import TimeframeFirstPolicy
+from o2dpg_runner.graph import descendants, longest_path_length, kahn_topological_order
+
+
+# ---------------------------------------------------------------------------
+# Data classes
+# ---------------------------------------------------------------------------
+
+@dataclass
+class SimTask:
+    tid: int
+    name: str
+    start: float       # wall seconds from t=0
+    finish: float
+    cpu: float         # cores booked
+    mem: float         # MB booked
+    walltime: float    # finish - start
+
+
+@dataclass
+class SimResult:
+    policy: str
+    makespan: float                        # total wall seconds
+    tasks: List[SimTask] = field(default_factory=list)
+    deadlocked_tids: List[int] = field(default_factory=list)
+
+    def cpu_utilization(self, cpu_limit: float) -> float:
+        """Mean CPU utilisation as a fraction of cpu_limit."""
+        if self.makespan <= 0 or cpu_limit <= 0:
+            return 0.0
+        total = sum(t.cpu * t.walltime for t in self.tasks)
+        return total / (self.makespan * cpu_limit)
+
+    def peak_mem_mb(self) -> float:
+        """Peak concurrent memory usage in MB (sweep-line)."""
+        events: List[Tuple[float, float]] = []
+        for t in self.tasks:
+            events.append((t.start,  +t.mem))
+            events.append((t.finish, -t.mem))
+        events.sort()
+        peak = cur = 0.0
+        for _, delta in events:
+            cur += delta
+            peak = max(peak, cur)
+        return peak
+
+    def to_dict(self) -> dict:
+        return {
+            "policy": self.policy,
+            "makespan_s": round(self.makespan, 3),
+            "tasks": [
+                {
+                    "tid": t.tid, "name": t.name,
+                    "start": round(t.start, 3), "finish": round(t.finish, 3),
+                    "cpu": round(t.cpu, 3), "mem": round(t.mem, 1),
+                    "walltime": round(t.walltime, 3),
+                }
+                for t in sorted(self.tasks, key=lambda x: x.start)
+            ],
+            "deadlocked_tids": self.deadlocked_tids,
+        }
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _global_name(name: str) -> str:
+    toks = name.split("_")
+    if toks and toks[-1].isdigit() and len(toks) > 1:
+        return "_".join(toks[:-1])
+    return name
+
+
+def _task_walltime(task: dict, cpu_fallback_factor: float) -> float:
+    """Return walltime [s] for a task, falling back to cpu * factor."""
+    wt = task.get("resources", {}).get("walltime")
+    if wt is not None:
+        try:
+            return max(1e-3, float(wt))
+        except (TypeError, ValueError):
+            pass
+    cpu = float(task.get("resources", {}).get("cpu", 1.0))
+    return max(1e-3, cpu * cpu_fallback_factor)
+
+
+def _sample_walltime(mean: float, std: float, rng: random.Random) -> float:
+    """Draw a walltime sample from a log-normal distribution.
+
+    Log-normal is a natural model for walltime: always positive, right-skewed
+    (occasional slow outliers).  When std=0 the mean is returned unchanged.
+    """
+    if std <= 1e-9 or mean <= 1e-9:
+        return max(1e-3, mean)
+    cv = std / mean
+    sigma2 = math.log(1.0 + cv * cv)
+    mu = math.log(mean) - 0.5 * sigma2
+    return max(1e-3, rng.lognormvariate(mu, math.sqrt(sigma2)))
+
+
+def _build_rm(workflow, cpu_limit: float, mem_limit: float) -> ResourceManager:
+    """Fresh ResourceManager with no backfill tier and unlimited job slots."""
+    rm = ResourceManager(
+        cpu_limit=cpu_limit,
+        mem_limit=mem_limit,
+        procs_parallel_max=10_000,   # effectively unlimited
+        n_backfill_max=0,            # single hard tier, no nicing
+        dynamic_resources=False,
+        optimistic_resources=False,
+    )
+    for task in workflow.stages:
+        rel = None
+        try:
+            rv = task["resources"].get("relative_cpu")
+            rel = float(rv) if rv is not None else None
+        except (TypeError, ValueError):
+            pass
+        try:
+            rm.add_task(
+                name=task["name"],
+                related_name=_global_name(task["name"]),
+                cpu=float(task["resources"]["cpu"]),
+                cpu_relative=rel,
+                mem=float(task["resources"]["mem"]),
+                semaphore_string=task.get("semaphore"),
+            )
+        except ResourceLimitExceeded as e:
+            print(f"  WARNING: task {task['name']} exceeds limits and will never run: {e}",
+                  file=sys.stderr)
+    return rm
+
+
+def _build_state(workflow, cpu_fallback_factor: float) -> SchedulerState:
+    n = workflow.n_tasks()
+    desc_cache: Dict = {}
+    desc_counts = [len(descendants(workflow.forward_adj, tid, desc_cache))
+                   for tid in range(n)]
+
+    timeframe_of = [t.get("timeframe", -1) for t in workflow.stages]
+    tf_weight = [(timeframe_of[i], desc_counts[i]) for i in range(n)]
+
+    cpu = [float(t.get("resources", {}).get("cpu", 1.0)) for t in workflow.stages]
+    mem = [float(t.get("resources", {}).get("mem", 0.0)) for t in workflow.stages]
+    walltime = [_task_walltime(t, cpu_fallback_factor) for t in workflow.stages]
+
+    has_walltime = any(t.get("resources", {}).get("walltime") for t in workflow.stages)
+    cp_weight = walltime if has_walltime else cpu
+    topo = kahn_topological_order(n, workflow.forward_adj, workflow.indegree)
+    cp = longest_path_length(workflow.forward_adj, topo, cp_weight)
+
+    return SchedulerState(
+        timeframe_of=timeframe_of,
+        descendants_count=desc_counts,
+        critical_path=cp,
+        task_cpu=cpu,
+        task_mem=mem,
+        task_walltime=walltime,
+        timeframe_weight=tf_weight,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Core simulation
+# ---------------------------------------------------------------------------
+
+def simulate(
+    workflow,
+    policy_name: str,
+    cpu_limit: float,
+    mem_limit: float,
+    cpu_fallback_factor: float = 10.0,
+    task_overhead: float = 0.1,
+    walltime_stds: Optional[Dict[str, float]] = None,
+    cv_fallback: float = 0.15,
+    rng: Optional[random.Random] = None,
+) -> SimResult:
+    """Run one discrete-event simulation; return SimResult.
+
+    When *rng* is provided, each task's walltime is sampled from
+    log-normal(mean, std).  The std is taken from *walltime_stds* when
+    available; otherwise *cv_fallback* × mean is used as a noise floor so
+    that tasks without learned variance still contribute to the distribution.
+    """
+    state = _build_state(workflow, cpu_fallback_factor)
+    mean_walltimes = [_task_walltime(t, cpu_fallback_factor) for t in workflow.stages]
+
+    # Sample walltimes for this simulation run.
+    if rng is not None:
+        walltimes = []
+        for i, task in enumerate(workflow.stages):
+            mean_wt = mean_walltimes[i]
+            base = _global_name(task["name"])
+            std_wt = (walltime_stds or {}).get(base, 0.0)
+            if std_wt <= 0 and cv_fallback > 0:
+                std_wt = mean_wt * cv_fallback
+            walltimes.append(_sample_walltime(mean_wt, std_wt, rng))
+    else:
+        walltimes = mean_walltimes
+
+    if policy_name == "timeframe":
+        policy = TimeframeFirstPolicy(drop_should_break=False)
+    else:
+        policy = get_policy(policy_name)
+
+    rm = _build_rm(workflow, cpu_limit, mem_limit)
+
+    n = workflow.n_tasks()
+    proc_status = ["ToDo"] * n
+    candidates: List[int] = [i for i in range(n) if workflow.indegree[i] == 0]
+    finished: Set[int] = set()
+    running: List[Tuple[int, float]] = []   # (tid, finish_time)
+    result = SimResult(policy=policy_name, makespan=0.0)
+    t = 0.0
+
+    for _guard in range(n * n + 1):   # at most n rounds to completion
+        # --- schedule everything that fits right now ---
+        ordered = policy.order(candidates, state)
+        for tid, nice in policy.pick_submittable(ordered, rm):
+            # book immediately so subsequent picks in this pass see the
+            # updated resource availability (mirrors executor behaviour)
+            rm.book(tid, rm.nice_default)
+            wt = walltimes[tid] + task_overhead
+            finish = t + wt
+            running.append((tid, finish))
+            candidates.remove(tid)
+            proc_status[tid] = "Running"
+            res = rm.resources[tid]
+            result.tasks.append(SimTask(
+                tid=tid,
+                name=workflow.id_to_name[tid],
+                start=t,
+                finish=finish,
+                cpu=res.cpu_assigned,
+                mem=res.mem_assigned,
+                walltime=wt,
+            ))
+
+        if not running:
+            break
+
+        # --- advance to next task completion ---
+        next_t = min(ft for _, ft in running)
+        t = next_t
+
+        # --- complete all tasks finishing at t (within float tolerance) ---
+        still_running: List[Tuple[int, float]] = []
+        for tid, ft in running:
+            if abs(ft - t) < 1e-9:
+                rm.unbook(tid)
+                proc_status[tid] = "Done"
+                finished.add(tid)
+                for succ in workflow.forward_adj[tid]:
+                    if proc_status[succ] == "ToDo":
+                        if all(p in finished for p in workflow.reverse_adj[succ]):
+                            candidates.append(succ)
+            else:
+                still_running.append((tid, ft))
+        running = still_running
+
+        if not candidates and not running:
+            break
+    else:
+        print(f"  WARNING [{policy_name}]: simulation hit guard limit — possible deadlock",
+              file=sys.stderr)
+
+    result.makespan = t
+    result.deadlocked_tids = [
+        i for i, s in enumerate(proc_status) if s == "ToDo"
+    ]
+    if result.deadlocked_tids:
+        names = [workflow.id_to_name[i] for i in result.deadlocked_tids]
+        print(f"  WARNING [{policy_name}]: {len(names)} tasks never scheduled "
+              f"(resource limits too tight?): {names[:5]}{'...' if len(names) > 5 else ''}",
+              file=sys.stderr)
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Presentation
+# ---------------------------------------------------------------------------
+
+def _fmt_time(s: float) -> str:
+    return f"{s:.1f}s"
+
+
+def print_summary(
+    results_by_policy: Dict[str, List[SimResult]],
+    cpu_limit: float,
+    n_samples: int,
+) -> None:
+    w = 16
+    stoch = n_samples > 1
+    mk_hdr = f"{'Makespan (mean±std)':>22}" if stoch else f"{'Makespan':>10}"
+    cpu_hdr = f"{'CPU util (mean±std)':>20}" if stoch else f"{'CPU util':>9}"
+    mem_hdr = f"{'Peak mem (mean±std)':>22}" if stoch else f"{'Peak mem':>10}"
+    header = f"{'Policy':<{w}} {mk_hdr} {cpu_hdr} {mem_hdr} {'Tasks':>6}"
+    print()
+    print(header)
+    print("-" * len(header))
+    for policy, runs in results_by_policy.items():
+        makespans = [r.makespan for r in runs]
+        mean_mk = statistics.mean(makespans)
+        util_pct = statistics.mean(r.cpu_utilization(cpu_limit) * 100 for r in runs)
+        peak = statistics.mean(r.peak_mem_mb() for r in runs)
+        n_tasks = runs[0].tasks.__len__() if runs else 0
+        if stoch:
+            std_mk   = statistics.stdev(makespans) if len(makespans) > 1 else 0.0
+            std_util = statistics.stdev(r.cpu_utilization(cpu_limit)*100 for r in runs) if len(runs)>1 else 0.0
+            std_peak = statistics.stdev(r.peak_mem_mb() for r in runs) if len(runs)>1 else 0.0
+            mk_str   = f"{_fmt_time(mean_mk)} ± {_fmt_time(std_mk)}"
+            print(f"{policy:<{w}} {mk_str:>22} {util_pct:>7.1f}±{std_util:.1f}% {peak:>8.0f}±{std_peak:.0f}MB {n_tasks:>6}")
+        else:
+            print(f"{policy:<{w}} {_fmt_time(mean_mk):>10} {util_pct:>8.1f}% "
+                  f"{peak:>9.0f}MB {n_tasks:>6}")
+    print()
+
+
+def print_verbose(result: SimResult) -> None:
+    print(f"\n--- Schedule: {result.policy} ---")
+    prev_t = -1.0
+    for task in sorted(result.tasks, key=lambda x: (x.start, x.name)):
+        if abs(task.start - prev_t) > 1e-9:
+            print(f"  t={_fmt_time(task.start)}")
+            prev_t = task.start
+        print(f"    START  {task.name:<40}  "
+              f"cpu={task.cpu:.1f}  mem={task.mem:.0f}MB  "
+              f"dur={_fmt_time(task.walltime)}")
+    print(f"  Makespan: {_fmt_time(result.makespan)}")
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        description="Simulate O2DPG workflow scheduling without running tasks.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    p.add_argument("-f", "--workflowfile", required=True)
+    p.add_argument("--update-resources", dest="update_resources", default=None,
+                   metavar="JSON",
+                   help="Apply learned resources (same file as --update-resources "
+                        "in the runner). Enables walltime-based critical path.")
+    p.add_argument("--cpu-limit", type=float, default=8.0)
+    p.add_argument("--mem-limit", type=float, default=60000.0, help="in MB")
+    p.add_argument("--policies", nargs="+",
+                   default=["timeframe", "critical-path", "best-fit"],
+                   choices=["timeframe", "critical-path", "best-fit"])
+    p.add_argument("-tt", "--target-tasks", nargs="+", default=["*"])
+    p.add_argument("--target-labels", nargs="+", default=[])
+    p.add_argument("--walltime-per-core", type=float, default=10.0, metavar="S",
+                   help="Fallback walltime per CPU core [s] when no learned "
+                        "walltime is available.")
+    p.add_argument("--task-overhead", type=float, default=0.1, metavar="S",
+                   help="Per-task scheduling overhead [s] added to every task's "
+                        "effective duration (covers systemd-run scope creation, "
+                        "bash/taskwrapper startup, etc.).")
+    p.add_argument("--samples", type=int, default=1, metavar="N",
+                   help="Number of Monte Carlo samples for stochastic simulation. "
+                        "When >1, walltime for each task is drawn from a log-normal "
+                        "distribution parameterised by lifetime.mean and lifetime.std "
+                        "from the learned JSON.  Output shows mean ± std of makespan.")
+    p.add_argument("--cv-fallback", type=float, default=0.15, metavar="CV",
+                   help="Coefficient of variation (std/mean) used as a noise floor "
+                        "for tasks whose learned walltime std is zero or absent "
+                        "(single-TF runs, old learned files, etc.). "
+                        "0 disables fallback and makes those tasks deterministic.")
+    p.add_argument("--verbose", action="store_true",
+                   help="Print per-task schedule for each policy.")
+    p.add_argument("--output", default=None, metavar="FILE",
+                   help="Write results as JSON to FILE.")
+    return p
+
+
+def main(argv=None) -> int:
+    ns = build_parser().parse_args(argv)
+
+    raw = load_json(ns.workflowfile)
+    target_tasks = [t.strip('"').strip("'") for t in ns.target_tasks]
+    wf = build_workflow(raw, target_tasks, ns.target_labels)
+    if not wf.stages:
+        print("Workflow is empty after filtering.")
+        return 1
+
+    # Load walltime std for stochastic mode.
+    walltime_stds: Dict[str, float] = {}
+    if ns.update_resources:
+        print(f"Applying learned resources from {ns.update_resources} ...")
+        update_resource_estimates(wf, ns.update_resources)
+        has_wt = sum(1 for t in wf.stages if t.get("resources", {}).get("walltime"))
+        print(f"  {has_wt}/{len(wf.stages)} tasks have learned walltime.")
+        if ns.samples > 1:
+            with open(ns.update_resources) as fh:
+                learned = json.load(fh)
+            for name, data in learned.items():
+                if name == "count":
+                    continue
+                std = data.get("lifetime", {}).get("std", 0.0) or 0.0
+                if std > 0:
+                    walltime_stds[name] = float(std)
+            print(f"  {len(walltime_stds)} tasks have walltime std for stochastic sampling.")
+    else:
+        print(f"No learned resources; using cpu * {ns.walltime_per_core}s as walltime proxy.")
+
+    # Stochastic mode activates whenever --samples > 1, regardless of whether
+    # learned stds are present.  Tasks without std use cv_fallback as noise.
+    stochastic = ns.samples > 1
+    if stochastic:
+        n_with_std = len(walltime_stds)
+        n_fallback = len(wf.stages) - n_with_std
+        print(f"  Stochastic: {n_with_std} tasks use learned std, "
+              f"{n_fallback} use cv_fallback={ns.cv_fallback:.2f}.")
+    print(f"Workflow: {len(wf.stages)} tasks, cpu_limit={ns.cpu_limit}, "
+          f"mem_limit={ns.mem_limit} MB, samples={ns.samples}"
+          + (" (stochastic)" if stochastic else " (deterministic)") + "\n")
+
+    results_by_policy: Dict[str, List[SimResult]] = {}
+    for policy_name in ns.policies:
+        runs: List[SimResult] = []
+        for s in range(ns.samples):
+            rng = random.Random(s) if stochastic else None
+            r = simulate(
+                wf, policy_name,
+                cpu_limit=ns.cpu_limit,
+                mem_limit=ns.mem_limit,
+                cpu_fallback_factor=ns.walltime_per_core,
+                task_overhead=ns.task_overhead,
+                walltime_stds=walltime_stds,
+                cv_fallback=ns.cv_fallback,
+                rng=rng,
+            )
+            runs.append(r)
+        results_by_policy[policy_name] = runs
+        makespans = [r.makespan for r in runs]
+        summary = _fmt_time(statistics.mean(makespans))
+        if stochastic:
+            summary += f" ± {_fmt_time(statistics.stdev(makespans))}"
+        print(f"  {policy_name:<16} makespan={summary}")
+
+    print_summary(results_by_policy, ns.cpu_limit, ns.samples)
+
+    if ns.verbose:
+        for policy_name, runs in results_by_policy.items():
+            print_verbose(runs[0])   # verbose shows first (or only) sample
+
+    if ns.output:
+        out = []
+        for policy_name, runs in results_by_policy.items():
+            for i, r in enumerate(runs):
+                d = r.to_dict()
+                d["sample"] = i
+                out.append(d)
+        with open(ns.output, "w") as fh:
+            json.dump(out, fh, indent=2)
+        print(f"Results written to {ns.output}")
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

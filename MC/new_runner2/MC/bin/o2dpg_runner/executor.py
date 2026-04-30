@@ -101,7 +101,6 @@ class WorkflowExecutor:
             update_resource_estimates(
                 workflow, config.update_resources,
                 logger=action_logger,
-                cpu_limit=config.cpu_limit,
             )
 
         # resource manager

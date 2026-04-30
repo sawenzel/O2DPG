@@ -3,6 +3,7 @@
 import sys
 from os.path import join, exists, basename
 from os import makedirs
+import os
 from copy import deepcopy
 import argparse
 import re
@@ -156,6 +157,9 @@ class Resources:
     self.name = None
     # use this as an id in the dataframe later
     self.timestamp = int(time_ns() / 1000)
+    # cgroup global entries (iter → {cpu_pct, mem_mb}); populated when the
+    # metric log contains __cgroup_global__ rows from the systemd-run backend
+    self.cgroup_global_rows = []
 
     if pipeline_path:
       self.extract_from_pipeline(pipeline_path)
@@ -309,8 +313,16 @@ class Resources:
           continue
 
         if "iter" in d:
-          # That is an iteration, add it to the dictionary
-          self.add_iteration(d)
+          # Intercept __cgroup_global__ rows before they reach add_iteration.
+          # These carry slice-level CPU (% units) and memory.current (MB).
+          if str(d.get("name", "")) == "__cgroup_global__":
+            self.cgroup_global_rows.append({
+                'iter':    d.get('iter'),
+                'cpu_pct': d.get('cpu'),   # % (100 = 1 core)
+                'mem_mb':  d.get('pss'),   # memory.current in MB
+            })
+          else:
+            self.add_iteration(d)
           continue
         if not self.meta:
           # at this point, the only other line in the pipeline_metric is the meta info, so when we end up here, we know that it is meta info
@@ -891,13 +903,30 @@ def print_statistics(resource_object):
   print ("Mean-PSS (MB): ", mean_pss)
   print ("Max-PSS (MB): ", max_pss)
 
-  #(b) CPU consumption
-  summed_cpu_per_iter=dframe.groupby("iter")['cpu'].sum()
-  mean_cpu = summed_cpu_per_iter.mean()
-  max_cpu = summed_cpu_per_iter.max()
-  print ("Mean-CPU (cores): ", mean_cpu)
-  print ("Max-CPU (cores): ", max_cpu)
-  print ("CPU-efficiency: ", mean_cpu / meta["cpu_limit"])
+  #(b) CPU consumption — prefer cgroup global (slice-level, immune to
+  # per-task psutil sampling artefacts) over the psutil per-task sum.
+  cg_rows = resource_object.cgroup_global_rows
+  if cg_rows:
+    cg_df = pd.DataFrame(cg_rows).dropna(subset=['cpu_pct'])
+    cg_by_iter = cg_df.groupby('iter')['cpu_pct'].mean()
+    mean_cpu = cg_by_iter.mean() / 100.0   # % → cores
+    max_cpu  = cg_by_iter.max()  / 100.0
+    print ("Mean-CPU (cores, cgroup): ", mean_cpu)
+    print ("Max-CPU  (cores, cgroup): ", max_cpu)
+    print ("CPU-efficiency (cgroup):  ", mean_cpu / meta["cpu_limit"])
+    # also print cgroup memory if available
+    cg_mem_df = pd.DataFrame(cg_rows).dropna(subset=['mem_mb'])
+    if not cg_mem_df.empty:
+      cg_mem = cg_mem_df.groupby('iter')['mem_mb'].mean()
+      print ("Mean-mem (MB, cgroup):   ", cg_mem.mean())
+      print ("Max-mem  (MB, cgroup):   ", cg_mem.max())
+  else:
+    summed_cpu_per_iter=dframe.groupby("iter")['cpu'].sum()
+    mean_cpu = summed_cpu_per_iter.mean()
+    max_cpu = summed_cpu_per_iter.max()
+    print ("Mean-CPU (cores): ", mean_cpu)
+    print ("Max-CPU (cores): ", max_cpu)
+    print ("CPU-efficiency: ", mean_cpu / meta["cpu_limit"])
 
   #(c) Top N memory consumers by name
   top_n = 5
@@ -973,6 +1002,7 @@ def produce_json_stat(resource_object):
   mean_lifetime = lifetime_per_tf.groupby('name')['lifetime'].mean()
   max_lifetime  = lifetime_per_tf.groupby('name')['lifetime'].max()
   min_lifetime  = lifetime_per_tf.groupby('name')['lifetime'].min()
+  std_lifetime  = lifetime_per_tf.groupby('name')['lifetime'].std().fillna(0.0)
 
   resource_json["count"] = 1 # basic sample size
 
@@ -998,7 +1028,8 @@ def produce_json_stat(resource_object):
         'lifetime': {
             'min' : r3(float(min_lifetime.get(name, np.nan))),
             'max' : r3(float(max_lifetime.get(name, np.nan))),
-            'mean' : r3(float(mean_lifetime.get(name, np.nan)))
+            'mean': r3(float(mean_lifetime.get(name, np.nan))),
+            'std' : r3(float(std_lifetime.get(name, 0.0))),
         }
     }
     # include cgroup metrics when available
@@ -1052,15 +1083,155 @@ def build_meta_header(arg):
     print ("Unsupported Meta input type")
   return meta
 
-def json_stat_impl(pipelines, output, header_data):
+def _read_log_time_file(fpath):
+  """Parse a *.log_time file written by GNU time via taskwrapper.
+
+  Returns a dict with 'walltime' [s], 'cpu_cores', 'maxmem_mb', or None
+  if the file cannot be parsed.
+
+  GNU time has ~10ms wall-clock resolution, so sub-10ms tasks report
+  walltime=0.00.  When that happens we fall back to usertime (CPU time in
+  user space) which sometimes captures the real duration better.  The
+  effective walltime is max(walltime, usertime) so we never under-count.
+  """
+  result = {}
+  try:
+    with open(fpath) as f:
+      for line in f:
+        line = line.strip().lstrip('#')
+        parts = line.split()
+        if not parts:
+          continue
+        key = parts[0]
+        if key == 'walltime' and len(parts) > 1:
+          result['walltime'] = float(parts[1])
+        elif key == 'usertime' and len(parts) > 1:
+          result['usertime'] = float(parts[1])
+        elif key == 'CPU' and len(parts) > 1:
+          result['cpu_cores'] = float(parts[1].rstrip('%')) / 100.0
+        elif key == 'maxmem' and len(parts) > 1:
+          result['maxmem_mb'] = float(parts[1]) / 1024.0   # KB -> MB
+  except (OSError, ValueError, IndexError):
+    return None
+  if 'walltime' not in result:
+    return None
+  # Only fall back to usertime when walltime rounded to 0 (GNU time has ~10ms
+  # resolution).  Do NOT use max(walltime, usertime): for multithreaded tasks
+  # usertime = sum of CPU time across all workers >> walltime, so max() would
+  # replace a correct 45s wall time with an incorrect 116s usertime.
+  if result['walltime'] == 0.0:
+    result['walltime'] = result.get('usertime', 0.0)
+  return result
+
+
+def _collect_log_times(search_path):
+  """Collect *.log_time files from search_path and one level of subdirectories.
+
+  Returns {base_task_name: [measurement_dict, ...]} where each measurement
+  dict has the keys returned by _read_log_time_file().
+  """
+  import glob
+  collected = {}
+  patterns = [
+    os.path.join(search_path, '*.log_time'),
+    os.path.join(search_path, '*', '*.log_time'),
+  ]
+  for pattern in patterns:
+    for fpath in sorted(glob.glob(pattern)):
+      fname = os.path.basename(fpath).replace('.log_time', '')
+      # Strip timeframe suffix _N to get base task name
+      parts = fname.split('_')
+      base = '_'.join(parts[:-1]) if (parts and parts[-1].isdigit() and len(parts) > 1) else fname
+      data = _read_log_time_file(fpath)
+      if data is not None:
+        collected.setdefault(base, []).append(data)
+  return collected
+
+
+def _stats_dict(values):
+  """Build a min/max/mean/std/count dict from a list of floats.
+
+  std is None when n=1 (sample std is undefined, not zero).
+  """
+  n = len(values)
+  if n == 0:
+    return None
+  mean = sum(values) / n
+  std = round((sum((x - mean) ** 2 for x in values) / (n - 1)) ** 0.5, 3) if n > 1 else None
+  return {
+    'min':  round(min(values), 3),
+    'max':  round(max(values), 3),
+    'mean': round(mean, 3),
+    'std':  std,
+    'M2': 0.0, 'count': n,
+  }
+
+
+def incorporate_log_times(json_path, search_path):
+  """Update a json-stat file with walltime (and cpu/mem) from *.log_time files.
+
+  For tasks already in the stat: overwrite lifetime with log_time walltime
+  (GNU time is more accurate than 1 Hz psutil sampling, especially for
+  short-lived tasks that only appear in one or two monitoring windows).
+
+  For tasks absent from the stat (finished before the first monitor sample):
+  add a new entry with walltime, approximate cpu, and approximate pss from
+  maxmem (RSS ≈ PSS for short-lived tasks).
+  """
+  log_times = _collect_log_times(search_path)
+  if not log_times:
+    print(f'  No *.log_time files found under {search_path}', file=sys.stderr)
+    return
+
+  with open(json_path) as f:
+    stat = json.load(f)
+
+  n_updated = n_added = 0
+  for base_name, measurements in sorted(log_times.items()):
+    walltimes  = [m['walltime']   for m in measurements]
+    cpu_cores  = [m['cpu_cores']  for m in measurements if 'cpu_cores'  in m]
+    maxmem_mbs = [m['maxmem_mb']  for m in measurements if 'maxmem_mb'  in m]
+
+    lifetime_entry = _stats_dict(walltimes)
+
+    if base_name in stat:
+      # Task is in the stat: replace lifetime with ground-truth log_time values.
+      stat[base_name]['lifetime'] = lifetime_entry
+      n_updated += 1
+    else:
+      # Task is absent (too short for monitor sampling): create a minimal entry.
+      entry = {'lifetime': lifetime_entry}
+      cpu_entry = _stats_dict(cpu_cores)
+      if cpu_entry:
+        entry['cpu'] = cpu_entry
+      mem_entry = _stats_dict(maxmem_mbs)
+      if mem_entry:
+        # maxmem (RSS) is a reasonable PSS proxy for short-lived tasks
+        entry['pss'] = mem_entry
+        entry['uss'] = mem_entry   # same approximation
+      stat[base_name] = entry
+      n_added += 1
+
+  with open(json_path, 'w') as f:
+    json.dump(stat, f, indent=2)
+
+  print(f'  log_time: updated lifetime for {n_updated} tasks, '
+        f'added {n_added} new tasks from {search_path}')
+
+
+def json_stat_impl(pipelines, output, header_data, log_time_path=None):
   resources = extract_resources(pipelines)
   all_stats = [produce_json_stat(res) for res in resources]
-
   merge_stats_into(all_stats, output, build_meta_header(header_data))
+
+  if log_time_path:
+    incorporate_log_times(output, log_time_path)
 
 
 def json_stat(args):
-  json_stat_impl(args.pipelines, args.output, args.header_data)
+  log_time_path = getattr(args, 'log_time_path', None)
+  json_stat_impl(args.pipelines, args.output, args.header_data,
+                 log_time_path=log_time_path)
 
 def merge_json_stats(args):
   all_stats = []
@@ -1323,6 +1494,14 @@ def main():
   json_stat_parser.add_argument("-p", "--pipelines", nargs="*", help="Pipeline_metric files from o2_dpg_workflow_runner; Merges information", required=True)
   json_stat_parser.add_argument("-o", "--output", type=str, help="Output json filename", required=True)
   json_stat_parser.add_argument("-hd", "--header-data", type=str, default='', help="Some meta-data headers to be included in the JSON")
+  json_stat_parser.add_argument("--log-time-path", dest="log_time_path", default=None,
+                                metavar="DIR",
+                                help="Directory to search for *.log_time files written by "
+                                     "taskwrapper (GNU time). Searched recursively one level "
+                                     "deep (covers tf1/, tf2/, ... subdirs). When provided, "
+                                     "lifetime values are replaced with the more accurate "
+                                     "GNU-time walltime, and tasks too short to appear in the "
+                                     "1 Hz monitor log are added from the log_time data.")
 
   merge_stat_parser = sub_parsers.add_parser("merge-json-stats", help="Merge information from json-stats into an aggregated stat")
   merge_stat_parser.set_defaults(func=merge_json_stats)

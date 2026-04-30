@@ -228,42 +228,10 @@ def build_workflow(
     return wf
 
 
-def _optimal_n_workers(
-    cpu_limit: float,
-    n_instances: int,
-    learned_cpu_max: float,
-    learned_cpu_mean: float,
-) -> int:
-    """Return the worker count that maximises CPU utilisation for this task type.
-
-    With N timeframe instances of a task and a global cpu_limit, the number
-    that can run simultaneously is k = min(N, floor(cpu_limit / n_workers)).
-    Utilisation is k * n_workers.  We search [1, upper] for the n_workers
-    that maximises utilisation; on ties we prefer the smaller value (more
-    parallelism, shorter critical path).
-
-    The upper bound is min(cpu_limit, ceil(cpu.max)) — never give a task
-    more workers than it was actually observed to use, and never more than
-    the total budget.
-    """
-    upper = min(int(cpu_limit), math.ceil(max(1.0, learned_cpu_max)))
-    # Sensible starting point: the mean usage rounded up.
-    best_n = max(1, math.ceil(learned_cpu_mean))
-    best_util = 0
-    for n in range(1, upper + 1):
-        k = min(n_instances, int(cpu_limit) // n)
-        util = k * n
-        if util > best_util:   # strict: first (smallest) n wins on equal util
-            best_util = util
-            best_n = n
-    return best_n
-
-
 def update_resource_estimates(
     workflow: Workflow,
     resource_json_path: str,
     logger=None,
-    cpu_limit: float = 0.0,
 ) -> None:
     """Apply learned resource estimates from a JSON file.
 
@@ -295,14 +263,6 @@ def update_resource_estimates(
     n_updated = 0
     missing_base_names: set = set()
 
-    # Count how many stages share each base name (needed for the worker
-    # packing optimisation: more instances → smaller optimal n_workers).
-    base_name_count: Dict[str, int] = {}
-    for task in workflow.stages:
-        tf = task.get("timeframe", -1)
-        bn = "_".join(task["name"].split("_")[:-1]) if tf >= 1 else task["name"]
-        base_name_count[bn] = base_name_count.get(bn, 0) + 1
-
     for task in workflow.stages:
         tf = task.get("timeframe", -1)
         name = task["name"]
@@ -316,9 +276,12 @@ def update_resource_estimates(
         task_updated = False
 
         walltime = new_res.get("lifetime", {}).get("mean")
-        if walltime is not None and float(walltime) > 0:
+        if walltime is not None:
+            # Store even when walltime=0 (sub-10ms tasks that GNU time rounds
+            # to zero).  The simulator clamps to a 1ms minimum so zero is
+            # handled gracefully; the fallback (cpu * factor) is always worse.
             task["resources"]["walltime"] = float(walltime)
-            _log.info("  WALLTIME %-40s  %.1f s", name, float(walltime))
+            _log.info("  WALLTIME %-40s  %.3f s", name, float(walltime))
             task_updated = True
 
         new_mem = new_res.get("pss", {}).get("max")
@@ -331,34 +294,30 @@ def update_resource_estimates(
         new_cpu = new_res.get("cpu", {}).get("mean")
         if new_cpu is not None:
             old_cpu = task["resources"]["cpu"]
-            # Do NOT apply relative_cpu scaling here.  The measured cpu.mean
-            # is already the observed average core usage; scaling it down by
-            # relative_cpu would cause the scheduler to underbook the task.
-            task["resources"]["cpu"] = new_cpu
-            _log.info("  CPU  %-40s  %.3f cores -> %.3f cores", name, float(old_cpu), new_cpu)
-            task_updated = True
+            uses_dynamic_workers = "O2DPG_DYNAMIC_NWORKER_OVERWRITE" in task.get("cmd", "")
 
-        # Set O2DPG_DYNAMIC_NWORKER_OVERWRITE so tasks using
-        # ${O2DPG_DYNAMIC_NWORKER_OVERWRITE:-N} pick up the learned count.
-        # The value is chosen to maximise CPU filling across all parallel
-        # instances of this task type (see _optimal_n_workers for the math).
-        cpu_max = new_res.get("cpu", {}).get("max")
-        cpu_mean = new_res.get("cpu", {}).get("mean")
-        if (cpu_max is not None and cpu_mean is not None
-                and "O2DPG_DYNAMIC_NWORKER_OVERWRITE" in task.get("cmd", "")):
-            n_instances = base_name_count.get(global_name, 1)
-            effective_limit = cpu_limit if cpu_limit > 0 else max(1.0, cpu_max)
-            n_workers = _optimal_n_workers(
-                effective_limit, n_instances, cpu_max, cpu_mean
-            )
-            if not isinstance(task.get("env"), dict):
-                task["env"] = {}
-            task["env"]["O2DPG_DYNAMIC_NWORKER_OVERWRITE"] = str(n_workers)
-            _log.info(
-                "  NWORKERS %-40s  -> %d  (N=%d, cpu_limit=%.0f, "
-                "cpu.max=%.2f, cpu.mean=%.2f)",
-                name, n_workers, n_instances, effective_limit, cpu_max, cpu_mean,
-            )
+            if uses_dynamic_workers:
+                # Round cpu.mean to the nearest integer worker count and use
+                # that value for BOTH the scheduler's cpu booking and the
+                # actual NWORKERS setting.  This keeps them consistent: the
+                # task will run with n_workers processes each using ~1 core,
+                # so total cpu ≈ n_workers = what we book.
+                n_workers = max(1, round(new_cpu))
+                task["resources"]["cpu"] = float(n_workers)
+                if not isinstance(task.get("env"), dict):
+                    task["env"] = {}
+                task["env"]["O2DPG_DYNAMIC_NWORKER_OVERWRITE"] = str(n_workers)
+                _log.info(
+                    "  CPU+NWORKERS %-36s  cpu.mean=%.2f -> %d workers, %.0f cores booked",
+                    name, new_cpu, n_workers, float(n_workers),
+                )
+            else:
+                # No dynamic worker override: book cpu.mean directly.
+                # Do NOT apply relative_cpu scaling — the measurement already
+                # reflects actual usage.
+                task["resources"]["cpu"] = new_cpu
+                _log.info("  CPU  %-40s  %.3f cores -> %.3f cores",
+                          name, float(old_cpu), new_cpu)
             task_updated = True
 
         if task_updated:
