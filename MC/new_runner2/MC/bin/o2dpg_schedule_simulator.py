@@ -143,6 +143,42 @@ def _task_walltime(task: dict, cpu_fallback_factor: float) -> float:
     return max(1e-3, cpu * cpu_fallback_factor)
 
 
+@dataclass
+class AmdahlModel:
+    """Amdahl scaling model derived from a single measurement point.
+
+    walltime(n) = t_serial + t_parallel_tot / n
+
+    t_serial and t_parallel_tot are solved from:
+      walltime_ref  = t_serial + t_parallel_tot / n_ref
+      cpu_mean_ref  = (t_serial + t_parallel_tot) / walltime_ref
+    """
+    t_serial: float
+    t_parallel_tot: float
+    n_ref: int
+    cpu_mean_ref: float
+    min_workers: int = 1
+    max_workers: int = 1
+
+    def walltime(self, n: int) -> float:
+        return max(1e-3, self.t_serial + self.t_parallel_tot / max(1, n))
+
+    @property
+    def worker_range(self) -> List[int]:
+        return list(range(self.min_workers, self.max_workers + 1))
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "AmdahlModel":
+        return cls(
+            t_serial=float(d["t_serial"]),
+            t_parallel_tot=float(d["t_parallel_tot"]),
+            n_ref=int(d["n_ref"]),
+            cpu_mean_ref=float(d["cpu_mean_ref"]),
+            min_workers=int(d.get("min_workers", 1)),
+            max_workers=int(d.get("max_workers", d["n_ref"])),
+        )
+
+
 def _sample_walltime(mean: float, std: float, rng: random.Random) -> float:
     """Draw a walltime sample from a log-normal distribution.
 
@@ -157,28 +193,41 @@ def _sample_walltime(mean: float, std: float, rng: random.Random) -> float:
     return max(1e-3, rng.lognormvariate(mu, math.sqrt(sigma2)))
 
 
-def _build_rm(workflow, cpu_limit: float, mem_limit: float) -> ResourceManager:
-    """Fresh ResourceManager with no backfill tier and unlimited job slots."""
+def _build_rm(
+    workflow,
+    cpu_limit: float,
+    mem_limit: float,
+    cpu_overrides: Optional[Dict[int, float]] = None,
+    maxjobs: int = 10_000,
+) -> ResourceManager:
+    """Fresh ResourceManager with no backfill tier and unlimited job slots.
+
+    *cpu_overrides* maps tid → cpu to override resources.cpu for specific
+    tasks (used by the worker-count optimizer).
+    """
     rm = ResourceManager(
         cpu_limit=cpu_limit,
         mem_limit=mem_limit,
-        procs_parallel_max=10_000,   # effectively unlimited
-        n_backfill_max=0,            # single hard tier, no nicing
+        procs_parallel_max=maxjobs,
+        n_backfill_max=0,
         dynamic_resources=False,
         optimistic_resources=False,
     )
-    for task in workflow.stages:
+    for i, task in enumerate(workflow.stages):
         rel = None
         try:
             rv = task["resources"].get("relative_cpu")
             rel = float(rv) if rv is not None else None
         except (TypeError, ValueError):
             pass
+        cpu = float(task["resources"]["cpu"])
+        if cpu_overrides and i in cpu_overrides:
+            cpu = cpu_overrides[i]
         try:
             rm.add_task(
                 name=task["name"],
                 related_name=_global_name(task["name"]),
-                cpu=float(task["resources"]["cpu"]),
+                cpu=cpu,
                 cpu_relative=rel,
                 mem=float(task["resources"]["mem"]),
                 semaphore_string=task.get("semaphore"),
@@ -232,16 +281,33 @@ def simulate(
     walltime_stds: Optional[Dict[str, float]] = None,
     cv_fallback: float = 0.15,
     rng: Optional[random.Random] = None,
+    amdahl_models: Optional[Dict[str, "AmdahlModel"]] = None,
+    worker_assignment: Optional[Dict[str, int]] = None,
+    maxjobs: int = 10_000,
 ) -> SimResult:
     """Run one discrete-event simulation; return SimResult.
 
     When *rng* is provided, each task's walltime is sampled from
     log-normal(mean, std).  The std is taken from *walltime_stds* when
-    available; otherwise *cv_fallback* × mean is used as a noise floor so
-    that tasks without learned variance still contribute to the distribution.
+    available; otherwise *cv_fallback* × mean is used as a noise floor.
+
+    When *amdahl_models* and *worker_assignment* are both provided, walltime
+    and cpu booking for scalable tasks are derived from the Amdahl model at
+    the assigned worker count rather than from the workflow resources.
     """
     state = _build_state(workflow, cpu_fallback_factor)
     mean_walltimes = [_task_walltime(t, cpu_fallback_factor) for t in workflow.stages]
+
+    # Apply Amdahl model overrides for scalable tasks.
+    cpu_overrides: Dict[int, float] = {}
+    if amdahl_models and worker_assignment:
+        for i, task in enumerate(workflow.stages):
+            base = _global_name(task["name"])
+            model = amdahl_models.get(base)
+            n = worker_assignment.get(base)
+            if model is not None and n is not None:
+                mean_walltimes[i] = model.walltime(n)
+                cpu_overrides[i] = float(n)
 
     # Sample walltimes for this simulation run.
     if rng is not None:
@@ -261,7 +327,8 @@ def simulate(
     else:
         policy = get_policy(policy_name)
 
-    rm = _build_rm(workflow, cpu_limit, mem_limit)
+    rm = _build_rm(workflow, cpu_limit, mem_limit,
+                   cpu_overrides=cpu_overrides or None, maxjobs=maxjobs)
 
     n = workflow.n_tasks()
     proc_status = ["ToDo"] * n
@@ -391,6 +458,74 @@ def print_verbose(result: SimResult) -> None:
 # CLI
 # ---------------------------------------------------------------------------
 
+def optimize_workers(
+    workflow,
+    policy_name: str,
+    cpu_limit: float,
+    mem_limit: float,
+    amdahl_models: Dict[str, AmdahlModel],
+    cpu_fallback_factor: float = 10.0,
+    task_overhead: float = 0.1,
+    n_eval_samples: int = 3,
+    rng_seed: int = 0,
+    maxjobs: int = 10_000,
+) -> Tuple[Dict[str, int], float]:
+    """Coordinate-descent search for the best worker assignment.
+
+    For each scalable task, iterates over its valid worker range (from the
+    Amdahl model) and picks the count that minimises mean makespan while
+    holding all other tasks fixed.  Repeats until no improvement is found.
+
+    Returns (best_assignment, best_makespan_s).
+    """
+    # Start from the current assignment implied by each model's cpu_mean_ref
+    # (what update_resource_estimates already set via round(cpu_mean)).
+    assignment: Dict[str, int] = {
+        name: max(model.min_workers,
+                  min(model.max_workers, max(1, round(model.cpu_mean_ref))))
+        for name, model in amdahl_models.items()
+    }
+
+    walltime_stds: Dict[str, float] = {}   # no learned std for optimizer runs
+
+    def _evaluate(asgn: Dict[str, int]) -> float:
+        makespans = []
+        for s in range(n_eval_samples):
+            rng = random.Random(rng_seed + s) if n_eval_samples > 1 else None
+            r = simulate(
+                workflow, policy_name, cpu_limit, mem_limit,
+                cpu_fallback_factor=cpu_fallback_factor,
+                task_overhead=task_overhead,
+                walltime_stds=walltime_stds,
+                cv_fallback=0.1,
+                rng=rng,
+                amdahl_models=amdahl_models,
+                worker_assignment=asgn,
+                maxjobs=maxjobs,
+            )
+            makespans.append(r.makespan)
+        return statistics.mean(makespans)
+
+    best_score = _evaluate(assignment)
+    improved = True
+    while improved:
+        improved = False
+        for name, model in amdahl_models.items():
+            best_n = assignment[name]
+            for n in model.worker_range:
+                if n == best_n:
+                    continue
+                trial = dict(assignment)
+                trial[name] = n
+                score = _evaluate(trial)
+                if score < best_score - 0.1:   # 0.1 s improvement threshold
+                    best_score = score
+                    best_n = n
+                    improved = True
+            assignment[name] = best_n
+    return assignment, best_score
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         description="Simulate O2DPG workflow scheduling without running tasks.",
@@ -425,6 +560,19 @@ def build_parser() -> argparse.ArgumentParser:
                         "for tasks whose learned walltime std is zero or absent "
                         "(single-TF runs, old learned files, etc.). "
                         "0 disables fallback and makes those tasks deterministic.")
+    p.add_argument("-j", "--maxjobs", type=int, default=0, metavar="N",
+                   help="Maximum concurrent tasks. -1 = serial mode (1 task at a time): "
+                        "reproduces the learning-run conditions (-jmax 1) and makes the "
+                        "optimizer prefer maximum workers per task. 0 = unlimited (default). "
+                        "N > 0 = at most N concurrent tasks.")
+    p.add_argument("--optimize-workers", action="store_true",
+                   help="Run coordinate-descent optimizer to find the best worker "
+                        "assignment for scalable tasks.  Requires --update-resources "
+                        "with a learned.json that contains 'amdahl' blocks (produced "
+                        "by json-stat --workflow workflow.json).")
+    p.add_argument("--opt-eval-samples", type=int, default=3, metavar="N",
+                   help="Simulator evaluations per candidate during optimization "
+                        "(more = less noise, slower).")
     p.add_argument("--verbose", action="store_true",
                    help="Print per-task schedule for each policy.")
     p.add_argument("--output", default=None, metavar="FILE",
@@ -474,6 +622,99 @@ def main(argv=None) -> int:
           f"mem_limit={ns.mem_limit} MB, samples={ns.samples}"
           + (" (stochastic)" if stochastic else " (deterministic)") + "\n")
 
+    # Load Amdahl models from learned.json (present when json-stat --workflow was used).
+    amdahl_models: Dict[str, AmdahlModel] = {}
+    if ns.update_resources:
+        with open(ns.update_resources) as fh:
+            learned_full = json.load(fh)
+        for name, data in learned_full.items():
+            if isinstance(data, dict) and "amdahl" in data:
+                try:
+                    amdahl_models[name] = AmdahlModel.from_dict(data["amdahl"])
+                except (KeyError, ValueError):
+                    pass
+        if amdahl_models:
+            print(f"  Amdahl models loaded for {len(amdahl_models)} scalable task(s): "
+                  f"{', '.join(sorted(amdahl_models))}")
+            if ns.verbose:
+                print()
+                for name, model in sorted(amdahl_models.items()):
+                    n_cur = max(model.min_workers,
+                                min(model.max_workers, max(1, round(model.cpu_mean_ref))))
+                    print(f"  Amdahl: {name}  "
+                          f"(n_ref={model.n_ref}, cpu_mean={model.cpu_mean_ref:.2f}, "
+                          f"t_serial={model.t_serial:.1f}s, "
+                          f"t_parallel_tot={model.t_parallel_tot:.1f}s)")
+                    print(f"    {'n':>4}  {'walltime':>10}  {'Δ vs current':>14}")
+                    wt_cur = model.walltime(n_cur)
+                    for n in model.worker_range:
+                        wt = model.walltime(n)
+                        marker = " ← current" if n == n_cur else ""
+                        print(f"    {n:>4}  {_fmt_time(wt):>10}  "
+                              f"{wt - wt_cur:>+12.1f}s{marker}")
+                    print()
+
+    # Resolve maxjobs — must come before optimizer and policy loops.
+    # -j -1 → serial + n_ref workers  -j 1 → serial + round(cpu_mean) workers
+    # -j  0 → unlimited (default)      -j N → at most N concurrent tasks
+    serial_mode = ns.maxjobs == -1
+    procs_limit = 1 if (serial_mode or ns.maxjobs == 1) else (10_000 if ns.maxjobs <= 0 else ns.maxjobs)
+    if serial_mode:
+        print("Serial mode (-j -1): reproducing learning-run conditions "
+              "(1 task at a time, n_ref workers per scalable task).")
+
+    # Worker-count optimizer (--optimize-workers).
+    if ns.optimize_workers:
+        if not amdahl_models:
+            print("WARNING: --optimize-workers requires Amdahl models in learned.json. "
+                  "Re-run json-stat with --workflow workflow.json first.", file=sys.stderr)
+        else:
+            print(f"\nOptimizing worker assignment over {len(amdahl_models)} scalable task(s)...")
+            for policy_name in ns.policies:
+                best_asgn, best_mk = optimize_workers(
+                    wf, policy_name, ns.cpu_limit, ns.mem_limit,
+                    amdahl_models=amdahl_models,
+                    cpu_fallback_factor=ns.walltime_per_core,
+                    task_overhead=ns.task_overhead,
+                    n_eval_samples=ns.opt_eval_samples,
+                    maxjobs=procs_limit,
+                )
+                print(f"\n  [{policy_name}] best makespan: {_fmt_time(best_mk)}")
+                print(f"  {'Task':<35} {'n_ref':>6} {'current':>8} {'→ opt':>6}  "
+                      f"{'wt(current)':>12}  {'wt(opt)':>10}  {'Δwt':>8}")
+                print(f"  {'-'*85}")
+                for name, model in sorted(amdahl_models.items()):
+                    n_cur = max(model.min_workers,
+                                min(model.max_workers, max(1, round(model.cpu_mean_ref))))
+                    n_opt = best_asgn[name]
+                    wt_cur = model.walltime(n_cur)
+                    wt_opt = model.walltime(n_opt)
+                    delta = wt_opt - wt_cur
+                    changed = "←" if n_opt != n_cur else ""
+                    print(f"  {name:<35} {model.n_ref:>6} {n_cur:>8} {n_opt:>6}  "
+                          f"{_fmt_time(wt_cur):>12}  {_fmt_time(wt_opt):>10}  "
+                          f"{delta:>+7.1f}s  {changed}")
+            print()
+
+    # Default worker assignment: round(cpu_mean) per scalable task.
+    # When Amdahl models are available, the policy-comparison simulations
+    # use this assignment so walltimes are Amdahl-predicted at the current
+    # worker count rather than the n_ref walltime from the learning run.
+    # This makes the default and optimizer evaluations directly comparable.
+    default_worker_assignment: Optional[Dict[str, int]] = None
+    if amdahl_models:
+        if serial_mode:
+            # Serial mode: use n_ref workers so walltime(n_ref) = measured walltime exactly.
+            default_worker_assignment = {name: m.n_ref for name, m in amdahl_models.items()}
+            parts = [f"{n}: {w}w (n_ref)" for n, w in sorted(default_worker_assignment.items())]
+        else:
+            default_worker_assignment = {
+                name: max(m.min_workers, min(m.max_workers, max(1, round(m.cpu_mean_ref))))
+                for name, m in amdahl_models.items()
+            }
+            parts = [f"{n}: {w}w" for n, w in sorted(default_worker_assignment.items())]
+        print(f"Worker counts for simulation: {', '.join(parts)}\n")
+
     results_by_policy: Dict[str, List[SimResult]] = {}
     for policy_name in ns.policies:
         runs: List[SimResult] = []
@@ -488,6 +729,9 @@ def main(argv=None) -> int:
                 walltime_stds=walltime_stds,
                 cv_fallback=ns.cv_fallback,
                 rng=rng,
+                amdahl_models=amdahl_models if amdahl_models else None,
+                worker_assignment=default_worker_assignment,
+                maxjobs=procs_limit,
             )
             runs.append(r)
         results_by_policy[policy_name] = runs

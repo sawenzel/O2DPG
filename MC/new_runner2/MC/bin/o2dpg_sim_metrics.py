@@ -157,6 +157,9 @@ class Resources:
     self.name = None
     # use this as an id in the dataframe later
     self.timestamp = int(time_ns() / 1000)
+    # actual elapsed walltime derived from log timestamps (more accurate than
+    # iter_count × monitor_interval, which ignores per-pass overhead)
+    self.wall_time_s = None
     # cgroup global entries (iter → {cpu_pct, mem_mb}); populated when the
     # metric log contains __cgroup_global__ rows from the systemd-run backend
     self.cgroup_global_rows = []
@@ -334,6 +337,13 @@ class Resources:
 
     if not self.check():
       return False
+
+    # Capture actual elapsed walltime from absolute log timestamps before
+    # compute_time_delta overwrites them with per-task deltas.
+    raw_times = [t for t in self.dict_for_df.get(METRIC_NAME_TIME, [])
+                 if t is not None and isinstance(t, (int, float))]
+    if len(raw_times) >= 2:
+      self.wall_time_s = max(raw_times) - min(raw_times)
 
     self.add_meta()
     self.convert_columns_to_float_if_possible()
@@ -883,18 +893,20 @@ def print_statistics(resource_object):
   dframe = resource_object.df
   meta = resource_object.meta
 
-  # estimate runtime from iteration count and monitor interval.
-  # The new runner writes monitor_interval_cpu into the metric meta; the
-  # prototype used a fixed 5 s cadence.
   max_iter = dframe['iter'].max()
-  monitor_interval = 5
-  if meta and 'monitor_interval_cpu' in meta:
-    try:
-      monitor_interval = float(meta['monitor_interval_cpu'])
-    except (TypeError, ValueError):
-      pass
-  print ("Iterations: ", max_iter)
-  print ("Estimated runtime (s): ", max_iter * monitor_interval)
+  print("Iterations: ", max_iter)
+  # Prefer actual walltime from log timestamps (last ts - first ts); fall
+  # back to iter_count × monitor_interval when timestamps are unavailable.
+  if getattr(resource_object, 'wall_time_s', None) is not None:
+    print("Actual walltime (s): ", round(resource_object.wall_time_s, 1))
+  else:
+    monitor_interval = 5
+    if meta and 'monitor_interval_cpu' in meta:
+      try:
+        monitor_interval = float(meta['monitor_interval_cpu'])
+      except (TypeError, ValueError):
+        pass
+    print("Estimated runtime (s): ", max_iter * monitor_interval)
 
   #(a) PSS memory
   summed_pss_per_iter=dframe.groupby("iter")['pss'].sum()
@@ -1219,7 +1231,124 @@ def incorporate_log_times(json_path, search_path):
         f'added {n_added} new tasks from {search_path}')
 
 
-def json_stat_impl(pipelines, output, header_data, log_time_path=None):
+_NWORKER_CMD_PATTERNS = [
+    re.compile(r'\$\{O2DPG_DYNAMIC_NWORKER_OVERWRITE:-(\d+)\}'),  # ${VAR:-N} — default value
+    re.compile(r'(?<![A-Za-z_])-j\s+(\d+)'),                      # -j N
+    re.compile(r'--tpc-lanes\s+(\d+)'),                            # --tpc-lanes N
+]
+
+
+def _extract_n_workers_from_cmd(cmd):
+  """Return the worker count embedded in a task command string, or None."""
+  for pat in _NWORKER_CMD_PATTERNS:
+    m = pat.search(cmd)
+    if m:
+      return int(m.group(1))
+  return None
+
+
+def _build_amdahl_model(walltime_ref, cpu_mean_ref, n_ref, min_workers=1, max_workers=None):
+  """Compute Amdahl model parameters from a single measurement point.
+
+  Given a task measured at n_ref workers with walltime_ref [s] and
+  cpu_mean_ref cores, solves for the serial and parallel components:
+
+    t_serial       = walltime_ref * (n_ref - cpu_mean_ref) / (n_ref - 1)
+    t_parallel_tot = walltime_ref * n_ref * (cpu_mean_ref - 1) / (n_ref - 1)
+    walltime(n)    = t_serial + t_parallel_tot / n
+
+  Returns None when the model cannot be derived (e.g. n_ref <= 1).
+  """
+  if n_ref <= 1 or walltime_ref <= 0 or cpu_mean_ref <= 0:
+    return None
+  t_serial = walltime_ref * (n_ref - cpu_mean_ref) / (n_ref - 1)
+  t_parallel_tot = max(0.0, walltime_ref * n_ref * (cpu_mean_ref - 1) / (n_ref - 1))
+  return {
+    't_serial':       round(t_serial, 3),
+    't_parallel_tot': round(t_parallel_tot, 3),
+    'n_ref':          n_ref,
+    'cpu_mean_ref':   round(cpu_mean_ref, 3),
+    'min_workers':    int(min_workers),
+    'max_workers':    int(max_workers if max_workers is not None else n_ref),
+  }
+
+
+def incorporate_amdahl_models(json_path, workflow_path):
+  """Build Amdahl scaling models and add them to the json-stat file.
+
+  Reads the original workflow.json to obtain n_ref (the worker count used
+  during the measurement run, i.e. the pre-update resources.cpu value for
+  tasks that carry O2DPG_DYNAMIC_NWORKER_OVERWRITE or a 'scaling' block).
+  Combines with cpu.mean and lifetime.mean from the json-stat to derive
+  t_serial and t_parallel_tot for each scalable task.
+  """
+  try:
+    with open(workflow_path) as f:
+      wf_raw = json.load(f)
+  except (OSError, json.JSONDecodeError) as e:
+    print(f'  WARNING: could not read workflow {workflow_path}: {e}', file=sys.stderr)
+    return
+
+  stages = wf_raw.get('stages', [])
+
+  # Collect n_ref and bounds per base task name from the workflow.
+  scalable = {}
+  for task in stages:
+    cmd = task.get('cmd', '')
+    res = task.get('resources', {}) or {}
+    scaling = res.get('scaling')
+    is_scalable = (
+        res.get('amdahl_scalable', False) or
+        'O2DPG_DYNAMIC_NWORKER_OVERWRITE' in cmd or
+        scaling is not None
+    )
+    if not is_scalable:
+      continue
+    name = task['name']
+    tf = task.get('timeframe', -1)
+    base = '_'.join(name.split('_')[:-1]) if (tf >= 1 and name.split('_')[-1].isdigit()) else name
+    if base in scalable:
+      continue  # use the first TF instance as representative
+
+    # n_ref = actual worker count used during the measurement run.
+    # Read from the cmd string (the ground truth) rather than resources.cpu
+    # which is a scheduler booking estimate and may be fractional/rounded.
+    n_ref_cmd = _extract_n_workers_from_cmd(cmd)
+    n_ref = n_ref_cmd if n_ref_cmd else max(1, int(round(float(res.get('cpu', 1)))))
+
+    min_w, max_w = 1, n_ref
+    if scaling:
+      min_w = int(scaling.get('min_workers', 1))
+      max_w = int(scaling.get('max_workers', n_ref))
+    scalable[base] = {'n_ref': n_ref, 'min_workers': min_w, 'max_workers': max_w}
+
+  with open(json_path) as f:
+    stat = json.load(f)
+
+  n_built = 0
+  for base_name, info in scalable.items():
+    if base_name not in stat:
+      continue
+    entry = stat[base_name]
+    cpu_mean = (entry.get('cpu') or {}).get('mean')
+    walltime_ref = (entry.get('lifetime') or {}).get('mean')
+    if cpu_mean is None or walltime_ref is None or walltime_ref <= 0:
+      continue
+    model = _build_amdahl_model(
+      walltime_ref, cpu_mean, info['n_ref'],
+      info['min_workers'], info['max_workers'],
+    )
+    if model:
+      stat[base_name]['amdahl'] = model
+      n_built += 1
+
+  with open(json_path, 'w') as f:
+    json.dump(stat, f, indent=2)
+
+  print(f'  Amdahl models built for {n_built}/{len(scalable)} scalable task(s).')
+
+
+def json_stat_impl(pipelines, output, header_data, log_time_path=None, workflow_path=None):
   resources = extract_resources(pipelines)
   all_stats = [produce_json_stat(res) for res in resources]
   merge_stats_into(all_stats, output, build_meta_header(header_data))
@@ -1227,11 +1356,15 @@ def json_stat_impl(pipelines, output, header_data, log_time_path=None):
   if log_time_path:
     incorporate_log_times(output, log_time_path)
 
+  if workflow_path:
+    incorporate_amdahl_models(output, workflow_path)
+
 
 def json_stat(args):
   log_time_path = getattr(args, 'log_time_path', None)
+  workflow_path = getattr(args, 'workflow_path', None)
   json_stat_impl(args.pipelines, args.output, args.header_data,
-                 log_time_path=log_time_path)
+                 log_time_path=log_time_path, workflow_path=workflow_path)
 
 def merge_json_stats(args):
   all_stats = []
@@ -1494,6 +1627,13 @@ def main():
   json_stat_parser.add_argument("-p", "--pipelines", nargs="*", help="Pipeline_metric files from o2_dpg_workflow_runner; Merges information", required=True)
   json_stat_parser.add_argument("-o", "--output", type=str, help="Output json filename", required=True)
   json_stat_parser.add_argument("-hd", "--header-data", type=str, default='', help="Some meta-data headers to be included in the JSON")
+  json_stat_parser.add_argument("-w", "--workflow", dest="workflow_path", default=None,
+                                metavar="WORKFLOW_JSON",
+                                help="Original workflow.json used for the measurement run. "
+                                     "When provided, Amdahl scaling models are computed for "
+                                     "tasks that carry O2DPG_DYNAMIC_NWORKER_OVERWRITE or a "
+                                     "'scaling' block, using the original resources.cpu as "
+                                     "n_ref combined with learned cpu.mean and lifetime.mean.")
   json_stat_parser.add_argument("--log-time-path", dest="log_time_path", default=None,
                                 metavar="DIR",
                                 help="Directory to search for *.log_time files written by "

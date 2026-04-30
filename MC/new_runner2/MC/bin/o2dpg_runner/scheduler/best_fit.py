@@ -10,9 +10,10 @@ Fitness = critical_path_weight * packing_tightness, where:
     cpu-weighted otherwise).  This is the "hybrid CP + packing" heuristic:
     prefer tasks on the longest critical path, but among those that fit
     similarly, pick the one that uses capacity most tightly.
-  - packing_tightness = 1 / max(cpu_ratio, mem_ratio) — dominant-resource
-    formulation.  The resource that is most constrained (cpu or mem)
-    determines the score; neither is suppressed as in the old 1/1000 weight.
+  - packing_tightness = max(c/cpu_free, m/mem_free) — dominant-resource
+    utilisation fraction.  A task scores high when it fills at least one
+    resource bin well; unlike 1/max(ratio), this is not dominated by a
+    resource with extreme slack (e.g. 60 GB mem_limit with tasks using 1 GB).
 
 Default ordering is still critical-path (good baseline); pick_submittable
 re-ranks on the fly within the fitting set.
@@ -47,10 +48,12 @@ class BestFitBackfillPolicy(SchedulerPolicy):
         mem_ratio = mem_free / m
         if cpu_ratio < 1 or mem_ratio < 1:
             return -1.0
-        # Dominant-resource tightness: scored by whichever resource is more
-        # constrained relative to free capacity.  1/max gives higher scores
-        # to tasks that use the scarce resource more fully.
-        tightness = 1.0 / max(cpu_ratio, mem_ratio)
+        # Dominant-resource utilisation: fraction of the most-used resource.
+        # max(c/cpu_free, m/mem_free) = max(1/cpu_ratio, 1/mem_ratio).
+        # Higher means the task fills at least one resource bin well.
+        # This is correct in both constrained and resource-ample (serial) modes:
+        # unlike 1/max(ratio), it is not dominated by a resource with extreme slack.
+        tightness = max(c / cpu_free, m / mem_free)
         # CP weight: remaining walltime on the longest path from this task.
         # Rewards placing tasks that unblock the most remaining work first.
         # Falls back to descendants_count+1 when no critical_path available.

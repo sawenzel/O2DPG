@@ -38,6 +38,8 @@ class CriticalPathPolicy(SchedulerPolicy):
             return
         skipped: List[int] = []
         for tid in ordered:
+            if rm.at_proc_cap():
+                return
             res = rm.resources[tid]
             if not rm.can_be_submitted_at_all(res):
                 continue
