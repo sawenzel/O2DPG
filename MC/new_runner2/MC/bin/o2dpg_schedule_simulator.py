@@ -401,8 +401,11 @@ def simulate(
         for tid, nice in policy.pick_submittable(ordered, rm):
             # book immediately so subsequent picks in this pass see the
             # updated resource availability (mirrors executor behaviour)
-            rm.book(tid, rm.nice_default)
-            wt = walltimes[tid] + task_overhead
+            rm.book(tid, nice)
+            slowdown = 1.0
+            if backfill_model == "slowdown" and nice != rm.nice_default:
+                slowdown = backfill_slowdown_factor
+            wt = walltimes[tid] * slowdown + task_overhead
             finish = t + wt
             running.append((tid, finish))
             candidates.remove(tid)
@@ -527,6 +530,11 @@ def optimize_workers(
     task_overhead: float = 0.1,
     n_eval_samples: int = 3,
     rng_seed: int = 0,
+    backfill_model: str = "off",
+    n_backfill: int = 1,
+    backfill_cpu_factor: float = 1.5,
+    backfill_mem_factor: float = 1.5,
+    backfill_slowdown_factor: float = 1.15,
     maxjobs: int = 10_000,
 ) -> Tuple[Dict[str, int], float]:
     """Coordinate-descent search for the best worker assignment.
@@ -560,6 +568,11 @@ def optimize_workers(
                 rng=rng,
                 amdahl_models=amdahl_models,
                 worker_assignment=asgn,
+                backfill_model=backfill_model,
+                n_backfill=n_backfill,
+                backfill_cpu_factor=backfill_cpu_factor,
+                backfill_mem_factor=backfill_mem_factor,
+                backfill_slowdown_factor=backfill_slowdown_factor,
                 maxjobs=maxjobs,
             )
             makespans.append(r.makespan)
@@ -609,6 +622,20 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Per-task scheduling overhead [s] added to every task's "
                         "effective duration (covers systemd-run scope creation, "
                         "bash/taskwrapper startup, etc.).")
+    p.add_argument("--backfill-model", default="off",
+                   choices=["off", "structural", "slowdown"],
+                   help="Backfill approximation used by the simulator. "
+                        "'structural' replays the runner's second admission lane; "
+                        "'slowdown' adds a fitted walltime penalty to backfill tasks.")
+    p.add_argument("--n-backfill", type=int, default=1, metavar="N",
+                   help="Maximum concurrent backfill tasks when backfill simulation is enabled.")
+    p.add_argument("--backfill-cpu-factor", type=float, default=1.5, metavar="X",
+                   help="Total CPU oversubscription factor allowed for backfill admission.")
+    p.add_argument("--backfill-mem-factor", type=float, default=1.5, metavar="X",
+                   help="Total memory oversubscription factor allowed for backfill admission.")
+    p.add_argument("--backfill-slowdown-factor", type=float, default=1.15, metavar="X",
+                   help="Walltime multiplier applied to backfill tasks in "
+                        "--backfill-model slowdown.")
     p.add_argument("--samples", type=int, default=1, metavar="N",
                    help="Number of Monte Carlo samples for stochastic simulation. "
                         "When >1, walltime for each task is drawn from a log-normal "
@@ -686,6 +713,13 @@ def main(argv=None) -> int:
     print(f"Workflow: {len(wf.stages)} tasks, cpu_limit={ns.cpu_limit}, "
           f"mem_limit={ns.mem_limit} MB, samples={ns.samples}"
           + (" (stochastic)" if stochastic else " (deterministic)") + "\n")
+    if ns.backfill_model != "off":
+        print(
+            "Backfill simulation: "
+            f"model={ns.backfill_model}, n_backfill={ns.n_backfill}, "
+            f"cpu_factor={ns.backfill_cpu_factor}, mem_factor={ns.backfill_mem_factor}, "
+            f"slowdown={ns.backfill_slowdown_factor:.2f}x\n"
+        )
 
     # Load Amdahl models from learned.json (present when json-stat --workflow was used).
     amdahl_models: Dict[str, AmdahlModel] = {}
@@ -745,6 +779,11 @@ def main(argv=None) -> int:
                     cpu_fallback_factor=ns.walltime_per_core,
                     task_overhead=ns.task_overhead,
                     n_eval_samples=ns.opt_eval_samples,
+                    backfill_model=ns.backfill_model,
+                    n_backfill=ns.n_backfill,
+                    backfill_cpu_factor=ns.backfill_cpu_factor,
+                    backfill_mem_factor=ns.backfill_mem_factor,
+                    backfill_slowdown_factor=ns.backfill_slowdown_factor,
                     maxjobs=procs_limit,
                 )
                 opt_results.append((policy_name, best_asgn, best_mk))
@@ -833,6 +872,11 @@ def main(argv=None) -> int:
                 rng=rng,
                 amdahl_models=amdahl_models if amdahl_models else None,
                 worker_assignment=default_worker_assignment,
+                backfill_model=ns.backfill_model,
+                n_backfill=ns.n_backfill,
+                backfill_cpu_factor=ns.backfill_cpu_factor,
+                backfill_mem_factor=ns.backfill_mem_factor,
+                backfill_slowdown_factor=ns.backfill_slowdown_factor,
                 maxjobs=procs_limit,
             )
             runs.append(r)

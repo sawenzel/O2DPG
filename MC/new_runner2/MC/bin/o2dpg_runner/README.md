@@ -149,7 +149,8 @@ The tests cover:
   with real subprocesses, exercising each policy, `--dry-run`,
   `--produce-script`, rerun-from-cache behavior.
 - `test_simulator.py` — simulator-only coverage for Amdahl-derived
-  critical-path weights and unschedulable-task handling.
+  critical-path weights, unschedulable-task handling, and simulated
+  backfill behaviour.
 
 Integration test (from the prototype, still valid):
 ```bash
@@ -198,3 +199,28 @@ resource parameters quickly, not to emulate Linux scheduling perfectly.
 - Tasks that exceed the hard simulated CPU/MEM limits are kept in the
   workflow model and reported as unschedulable, rather than being
   dropped from resource bookkeeping.
+
+### Simulated backfill
+
+The real runner has a two-lane admission model: default tasks stay
+within the hard budget, while backfill tasks may use a bounded amount of
+overcommit and run at lower priority. The simulator now offers a
+"sweet-spot" approximation of that behaviour:
+
+- `--backfill-model off` — no backfill, one hard budget only.
+- `--backfill-model structural` — replay the runner's second admission
+  lane (`n_backfill`, CPU factor, MEM factor), but do not change task
+  duration.
+- `--backfill-model slowdown` — same structural backfill admission, plus
+  a single fitted slowdown factor applied to backfill task walltimes.
+
+Relevant knobs:
+
+- `--n-backfill`
+- `--backfill-cpu-factor`
+- `--backfill-mem-factor`
+- `--backfill-slowdown-factor`
+
+This is intentionally a scheduler-level approximation, not a kernel CPU
+sharing model. It is accurate enough for comparative studies while still
+remaining easy to reason about and calibrate against real runs.

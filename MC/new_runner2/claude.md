@@ -173,6 +173,14 @@ In rough priority order:
   used for fast policy comparison and worker-count tuning.
 - It supports walltime-weighted critical path, Monte Carlo walltime
   sampling, and Amdahl-based worker-count optimization/write-back.
+- Simulated backfill now has three modes:
+  - `off` — one hard budget only.
+  - `structural` — second admission lane with runner-like
+    `n_backfill`, CPU-factor, and MEM-factor rules.
+  - `slowdown` — same structural model plus a single fitted slowdown
+    multiplier for backfill tasks.
+- This is deliberately not a kernel-level model of Linux `nice`; it is a
+  scheduler-level approximation intended for comparative studies.
 
 ## Conventions and style
 

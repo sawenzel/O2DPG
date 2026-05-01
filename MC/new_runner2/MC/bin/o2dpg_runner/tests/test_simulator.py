@@ -69,6 +69,27 @@ def test_simulator_keeps_tid_mapping_when_task_exceeds_limits():
     assert result.deadlocked_tids == [0]
 
 
+def test_simulator_backfill_slowdown_marks_and_slows_backfill_tasks():
+    wf = _wf([
+        _task("small1", cpu=2, walltime=3.0),
+        _task("big", cpu=3, walltime=8.0),
+        _task("small2", cpu=2, walltime=3.0),
+    ])
+    result = sim.simulate(
+        wf,
+        "timeframe",
+        cpu_limit=4.0,
+        mem_limit=1000.0,
+        backfill_model="slowdown",
+        n_backfill=1,
+        backfill_slowdown_factor=1.25,
+    )
+    by_name = {t.name: t for t in result.tasks}
+    assert "big" in by_name
+    assert by_name["big"].start == pytest.approx(0.0)
+    assert by_name["big"].walltime == pytest.approx(8.0 * 1.25 + 0.1)
+
+
 def test_amdahl_model_rejects_negative_components():
     with pytest.raises(ValueError):
         sim.AmdahlModel.from_dict(
