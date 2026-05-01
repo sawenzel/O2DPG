@@ -62,11 +62,13 @@ class EarlyFileRemover:
         filegraph_path: str,
         timeframes: Set[int],
         target_namelist: List[str],
+        logger: Optional[logging.Logger] = None,
     ):
         with open(filegraph_path) as f:
             data = json.load(f)
         self.file_dict = _filegraph_expand_timeframes(data, timeframes, target_namelist)
         self.timeframes = timeframes
+        self.log = logger if logger is not None else log
         # Pre-build a reverse index: task_name -> list[file_entry dict] (all TFs)
         # so completions don't re-scan the whole file map.
         self._by_task: Dict[str, List[Dict]] = {}
@@ -88,29 +90,29 @@ class EarlyFileRemover:
                     and not entry.get("keep", False)):
                 self._remove_if_exists(entry["file"])
 
-    @staticmethod
-    def _remove_if_exists(path: str) -> bool:
+    def _remove_if_exists(self, path: str) -> bool:
         if os.path.exists(path):
             try:
                 sz = os.path.getsize(path)
                 os.remove(path)
-                log.info("Removing %s (no longer needed); freed %.2f MB",
-                         path, sz / 1024.0 / 1024.0)
+                self.log.info("Removing %s (no longer needed); freed %.2f MB",
+                              path, sz / 1024.0 / 1024.0)
                 return True
             except OSError as e:
-                log.warning("Could not remove %s: %s", path, e)
+                self.log.warning("Could not remove %s: %s", path, e)
         return False
 
 
-def archive_task_logs(logfile: str) -> None:
+def archive_task_logs(logfile: str, logger: Optional[logging.Logger] = None) -> None:
     """Append <logfile>, <logfile>_done, <logfile>_time to a tar archive
     and delete the originals. Used in production mode."""
+    logger = logger if logger is not None else log
     done = logfile + "_done"
     timef = logfile + "_time"
     try:
         tf = tarfile.open(name="pipeline_log_archive.log.tar", mode="a")
     except Exception as e:
-        log.warning("Could not open log archive: %s", e)
+        logger.warning("Could not open log archive: %s", e)
         return
     try:
         for path in (logfile, done, timef):
@@ -118,7 +120,7 @@ def archive_task_logs(logfile: str) -> None:
                 try:
                     tf.add(path)
                 except Exception as e:
-                    log.warning("tar add %s failed: %s", path, e)
+                    logger.warning("tar add %s failed: %s", path, e)
     finally:
         tf.close()
 
@@ -127,4 +129,4 @@ def archive_task_logs(logfile: str) -> None:
             try:
                 os.remove(path)
             except OSError as e:
-                log.warning("Could not remove %s: %s", path, e)
+                logger.warning("Could not remove %s: %s", path, e)

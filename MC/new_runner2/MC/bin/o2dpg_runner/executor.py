@@ -196,6 +196,7 @@ class WorkflowExecutor:
                     config.remove_files_early,
                     workflow.timeframes,
                     workflow.full_target_names,
+                    logger=action_logger,
                 )
             except Exception as e:
                 log.warning("Could not set up early file removal: %s", e)
@@ -409,6 +410,8 @@ class WorkflowExecutor:
             if self.ok_to_skip(tid):
                 finished_out.append(tid)
                 self.actionlog.info("Skipping %s", self.wf.id_to_name[tid])
+                if self.file_remover is not None:
+                    self.file_remover.on_task_done(self.wf.id_to_name[tid])
             else:
                 remaining.append(tid)
         # mutate the list the caller passed in
@@ -504,6 +507,10 @@ class WorkflowExecutor:
                 rt = self.task_runtime.get(tid)
                 if rt is not None:
                     self.cache.record(rt.logfile, rt.fingerprint)
+                if self.file_remover is not None:
+                    self.file_remover.on_task_done(name)
+                if self.cfg.production_mode:
+                    archive_task_logs(self.logfile(tid), logger=self.actionlog)
             else:
                 print(f"{name} failed ... checking retry")
                 max_retries = max(self.cfg.retry_on_failure, self.task_retries[tid])
@@ -699,14 +706,6 @@ class WorkflowExecutor:
 
                 finished.extend(finished_running)
                 finishedtasks_set.update(finished)
-
-                # per-task hooks on completed tasks
-                if self.file_remover is not None:
-                    for tid in finished_running:
-                        self.file_remover.on_task_done(self.wf.id_to_name[tid])
-                if self.cfg.production_mode:
-                    for tid in finished_running:
-                        archive_task_logs(self.logfile(tid))
 
                 # take failed tasks out of the "finished" accounting
                 if failing:

@@ -372,9 +372,8 @@ def main(argv=None) -> int:
     for h in list(pkg_log.handlers):
         pkg_log.removeHandler(h)
     pkg_log.propagate = False
-    _h = logging.FileHandler(action_log, mode="a")
-    _h.setFormatter(_FORMATTER)
-    pkg_log.addHandler(_h)
+    for h in action_logger.handlers:
+        pkg_log.addHandler(h)
 
     # Apply slice-level cgroup resource limits now that we are inside the
     # slice and the action logger is ready to record the outcome.
@@ -443,7 +442,7 @@ def main(argv=None) -> int:
             if o2dpg_root and fileaccess_log_file:
                 analyse_cmd = [
                     sys.executable,
-                    f"{o2dpg_root}/UTILS/FileIOGraph/analyse_FileIO.py",
+                    f"{o2dpg_root}/UTILS/FileIOGraph/analyse_FileIO_v2.py",
                     "--actionFile", action_log,
                     "--monitorFile", fileaccess_log_file,
                     "-o", f"pipeline_fileaccess_report_{os.getpid()}.json",

@@ -40,6 +40,7 @@ JSON output for downstream analysis:
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import math
 import os
@@ -573,6 +574,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--opt-eval-samples", type=int, default=3, metavar="N",
                    help="Simulator evaluations per candidate during optimization "
                         "(more = less noise, slower).")
+    p.add_argument("--write-optimized", default=None, metavar="FILE",
+                   help="After --optimize-workers, write a copy of the learned JSON "
+                        "with updated lifetime.mean and cpu.mean for scalable tasks. "
+                        "Pass this file to --update-resources in the runner to apply "
+                        "optimized worker counts.  When multiple --policies are given "
+                        "the policy with the best (lowest) optimized makespan is used.")
     p.add_argument("--verbose", action="store_true",
                    help="Print per-task schedule for each policy.")
     p.add_argument("--output", default=None, metavar="FILE",
@@ -624,6 +631,7 @@ def main(argv=None) -> int:
 
     # Load Amdahl models from learned.json (present when json-stat --workflow was used).
     amdahl_models: Dict[str, AmdahlModel] = {}
+    learned_full: Dict = {}
     if ns.update_resources:
         with open(ns.update_resources) as fh:
             learned_full = json.load(fh)
@@ -664,6 +672,8 @@ def main(argv=None) -> int:
               "(1 task at a time, n_ref workers per scalable task).")
 
     # Worker-count optimizer (--optimize-workers).
+    # opt_results: list of (policy_name, assignment, makespan) for write-back.
+    opt_results: List[Tuple[str, Dict[str, int], float]] = []
     if ns.optimize_workers:
         if not amdahl_models:
             print("WARNING: --optimize-workers requires Amdahl models in learned.json. "
@@ -679,6 +689,7 @@ def main(argv=None) -> int:
                     n_eval_samples=ns.opt_eval_samples,
                     maxjobs=procs_limit,
                 )
+                opt_results.append((policy_name, best_asgn, best_mk))
                 print(f"\n  [{policy_name}] best makespan: {_fmt_time(best_mk)}")
                 print(f"  {'Task':<35} {'n_ref':>6} {'current':>8} {'→ opt':>6}  "
                       f"{'wt(current)':>12}  {'wt(opt)':>10}  {'Δwt':>8}")
@@ -695,6 +706,39 @@ def main(argv=None) -> int:
                           f"{_fmt_time(wt_cur):>12}  {_fmt_time(wt_opt):>10}  "
                           f"{delta:>+7.1f}s  {changed}")
             print()
+
+        # Write optimized learned.json if requested.
+        if ns.write_optimized and opt_results:
+            best_policy, best_asgn, best_mk = min(opt_results, key=lambda x: x[2])
+            if len(ns.policies) > 1:
+                print(f"Writing optimized resources: policy '{best_policy}' "
+                      f"selected (best makespan {_fmt_time(best_mk)}).")
+            else:
+                print(f"Writing optimized resources (makespan {_fmt_time(best_mk)}).")
+            out_learned = copy.deepcopy(learned_full)
+            n_changed = 0
+            for name, model in amdahl_models.items():
+                if name not in out_learned:
+                    continue
+                n_opt = best_asgn[name]
+                n_cur = max(model.min_workers,
+                            min(model.max_workers, max(1, round(model.cpu_mean_ref))))
+                # Update lifetime.mean to Amdahl-predicted walltime at n_opt.
+                if "lifetime" not in out_learned[name]:
+                    out_learned[name]["lifetime"] = {}
+                out_learned[name]["lifetime"]["mean"] = round(model.walltime(n_opt), 3)
+                # Update cpu.mean to n_opt so update_resource_estimates rounds it
+                # to n_opt workers and sets O2DPG_DYNAMIC_NWORKER_OVERWRITE accordingly.
+                if "cpu" not in out_learned[name]:
+                    out_learned[name]["cpu"] = {}
+                out_learned[name]["cpu"]["mean"] = float(n_opt)
+                if n_opt != n_cur:
+                    n_changed += 1
+            with open(ns.write_optimized, "w") as fh:
+                json.dump(out_learned, fh, indent=2)
+            print(f"  Wrote {ns.write_optimized}  "
+                  f"({len(amdahl_models)} scalable tasks updated, "
+                  f"{n_changed} changed from current assignment).")
 
     # Default worker assignment: round(cpu_mean) per scalable task.
     # When Amdahl models are available, the policy-comparison simulations
