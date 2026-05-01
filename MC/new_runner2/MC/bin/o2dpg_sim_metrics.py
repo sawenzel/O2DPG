@@ -1261,6 +1261,11 @@ def _build_amdahl_model(walltime_ref, cpu_mean_ref, n_ref, min_workers=1, max_wo
   """
   if n_ref <= 1 or walltime_ref <= 0 or cpu_mean_ref <= 0:
     return None
+  # Amdahl's law assumes the observed mean CPU lies within the physically
+  # meaningful range [1, n_ref].  Outside that interval, the fitted serial
+  # component would go negative or the parallel term would be nonsensical.
+  if cpu_mean_ref < 1.0 or cpu_mean_ref > n_ref:
+    return None
   t_serial = walltime_ref * (n_ref - cpu_mean_ref) / (n_ref - 1)
   t_parallel_tot = max(0.0, walltime_ref * n_ref * (cpu_mean_ref - 1) / (n_ref - 1))
   return {

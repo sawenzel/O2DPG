@@ -170,7 +170,7 @@ class AmdahlModel:
 
     @classmethod
     def from_dict(cls, d: dict) -> "AmdahlModel":
-        return cls(
+        model = cls(
             t_serial=float(d["t_serial"]),
             t_parallel_tot=float(d["t_parallel_tot"]),
             n_ref=int(d["n_ref"]),
@@ -178,6 +178,11 @@ class AmdahlModel:
             min_workers=int(d.get("min_workers", 1)),
             max_workers=int(d.get("max_workers", d["n_ref"])),
         )
+        if model.t_serial < 0 or model.t_parallel_tot < 0:
+            raise ValueError("Amdahl model has negative serial/parallel component")
+        if model.n_ref < 1 or model.min_workers < 1 or model.max_workers < model.min_workers:
+            raise ValueError("Amdahl model has invalid worker bounds")
+        return model
 
 
 def _sample_walltime(mean: float, std: float, rng: random.Random) -> float:
@@ -199,8 +204,11 @@ def _build_rm(
     cpu_limit: float,
     mem_limit: float,
     cpu_overrides: Optional[Dict[int, float]] = None,
+    n_backfill_max: int = 0,
+    backfill_cpu_factor: float = 1.5,
+    backfill_mem_factor: float = 1.5,
     maxjobs: int = 10_000,
-) -> ResourceManager:
+) -> Tuple[ResourceManager, Set[int]]:
     """Fresh ResourceManager with no backfill tier and unlimited job slots.
 
     *cpu_overrides* maps tid → cpu to override resources.cpu for specific
@@ -210,10 +218,13 @@ def _build_rm(
         cpu_limit=cpu_limit,
         mem_limit=mem_limit,
         procs_parallel_max=maxjobs,
-        n_backfill_max=0,
+        n_backfill_max=n_backfill_max,
+        backfill_cpu_factor=backfill_cpu_factor,
+        backfill_mem_factor=backfill_mem_factor,
         dynamic_resources=False,
-        optimistic_resources=False,
+        optimistic_resources=True,
     )
+    impossible_tids: Set[int] = set()
     for i, task in enumerate(workflow.stages):
         rel = None
         try:
@@ -224,22 +235,37 @@ def _build_rm(
         cpu = float(task["resources"]["cpu"])
         if cpu_overrides and i in cpu_overrides:
             cpu = cpu_overrides[i]
+        mem = float(task["resources"]["mem"])
+        if cpu > cpu_limit or mem > mem_limit:
+            impossible_tids.add(i)
         try:
             rm.add_task(
                 name=task["name"],
                 related_name=_global_name(task["name"]),
                 cpu=cpu,
                 cpu_relative=rel,
-                mem=float(task["resources"]["mem"]),
+                mem=mem,
                 semaphore_string=task.get("semaphore"),
             )
         except ResourceLimitExceeded as e:
             print(f"  WARNING: task {task['name']} exceeds limits and will never run: {e}",
                   file=sys.stderr)
-    return rm
+    if impossible_tids:
+        names = [workflow.stages[i]["name"] for i in sorted(impossible_tids)]
+        print(
+            "  WARNING: tasks exceed the hard simulator limits and will remain unscheduled: "
+            f"{names[:5]}{'...' if len(names) > 5 else ''}",
+            file=sys.stderr,
+        )
+    return rm, impossible_tids
 
 
-def _build_state(workflow, cpu_fallback_factor: float) -> SchedulerState:
+def _build_state(
+    workflow,
+    cpu_fallback_factor: float,
+    cpu_overrides: Optional[Dict[int, float]] = None,
+    walltime_overrides: Optional[Dict[int, float]] = None,
+) -> SchedulerState:
     n = workflow.n_tasks()
     desc_cache: Dict = {}
     desc_counts = [len(descendants(workflow.forward_adj, tid, desc_cache))
@@ -249,8 +275,14 @@ def _build_state(workflow, cpu_fallback_factor: float) -> SchedulerState:
     tf_weight = [(timeframe_of[i], desc_counts[i]) for i in range(n)]
 
     cpu = [float(t.get("resources", {}).get("cpu", 1.0)) for t in workflow.stages]
+    if cpu_overrides:
+        for tid, value in cpu_overrides.items():
+            cpu[tid] = float(value)
     mem = [float(t.get("resources", {}).get("mem", 0.0)) for t in workflow.stages]
     walltime = [_task_walltime(t, cpu_fallback_factor) for t in workflow.stages]
+    if walltime_overrides:
+        for tid, value in walltime_overrides.items():
+            walltime[tid] = float(value)
 
     has_walltime = any(t.get("resources", {}).get("walltime") for t in workflow.stages)
     cp_weight = walltime if has_walltime else cpu
@@ -284,6 +316,11 @@ def simulate(
     rng: Optional[random.Random] = None,
     amdahl_models: Optional[Dict[str, "AmdahlModel"]] = None,
     worker_assignment: Optional[Dict[str, int]] = None,
+    backfill_model: str = "off",
+    n_backfill: int = 1,
+    backfill_cpu_factor: float = 1.5,
+    backfill_mem_factor: float = 1.5,
+    backfill_slowdown_factor: float = 1.15,
     maxjobs: int = 10_000,
 ) -> SimResult:
     """Run one discrete-event simulation; return SimResult.
@@ -296,11 +333,11 @@ def simulate(
     and cpu booking for scalable tasks are derived from the Amdahl model at
     the assigned worker count rather than from the workflow resources.
     """
-    state = _build_state(workflow, cpu_fallback_factor)
     mean_walltimes = [_task_walltime(t, cpu_fallback_factor) for t in workflow.stages]
 
     # Apply Amdahl model overrides for scalable tasks.
     cpu_overrides: Dict[int, float] = {}
+    walltime_overrides: Dict[int, float] = {}
     if amdahl_models and worker_assignment:
         for i, task in enumerate(workflow.stages):
             base = _global_name(task["name"])
@@ -308,7 +345,15 @@ def simulate(
             n = worker_assignment.get(base)
             if model is not None and n is not None:
                 mean_walltimes[i] = model.walltime(n)
+                walltime_overrides[i] = mean_walltimes[i]
                 cpu_overrides[i] = float(n)
+
+    state = _build_state(
+        workflow,
+        cpu_fallback_factor,
+        cpu_overrides=cpu_overrides or None,
+        walltime_overrides=walltime_overrides or None,
+    )
 
     # Sample walltimes for this simulation run.
     if rng is not None:
@@ -328,12 +373,23 @@ def simulate(
     else:
         policy = get_policy(policy_name)
 
-    rm = _build_rm(workflow, cpu_limit, mem_limit,
-                   cpu_overrides=cpu_overrides or None, maxjobs=maxjobs)
+    use_backfill = backfill_model in ("structural", "slowdown")
+    rm, impossible_tids = _build_rm(
+        workflow,
+        cpu_limit,
+        mem_limit,
+        cpu_overrides=cpu_overrides or None,
+        n_backfill_max=n_backfill if use_backfill else 0,
+        backfill_cpu_factor=backfill_cpu_factor,
+        backfill_mem_factor=backfill_mem_factor,
+        maxjobs=maxjobs,
+    )
 
     n = workflow.n_tasks()
     proc_status = ["ToDo"] * n
-    candidates: List[int] = [i for i in range(n) if workflow.indegree[i] == 0]
+    candidates: List[int] = [
+        i for i in range(n) if workflow.indegree[i] == 0 and i not in impossible_tids
+    ]
     finished: Set[int] = set()
     running: List[Tuple[int, float]] = []   # (tid, finish_time)
     result = SimResult(policy=policy_name, makespan=0.0)
@@ -378,6 +434,8 @@ def simulate(
                 finished.add(tid)
                 for succ in workflow.forward_adj[tid]:
                     if proc_status[succ] == "ToDo":
+                        if succ in impossible_tids:
+                            continue
                         if all(p in finished for p in workflow.reverse_adj[succ]):
                             candidates.append(succ)
             else:

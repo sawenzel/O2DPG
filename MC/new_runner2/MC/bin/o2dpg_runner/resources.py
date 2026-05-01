@@ -179,6 +179,8 @@ class ResourceManager:
         mem_limit: float,
         procs_parallel_max: int = 100,
         n_backfill_max: int = 1,
+        backfill_cpu_factor: float = 1.5,
+        backfill_mem_factor: float = 1.5,
         dynamic_resources: bool = False,
         optimistic_resources: bool = False,
     ):
@@ -201,6 +203,8 @@ class ResourceManager:
 
         self.procs_parallel_max = procs_parallel_max
         self.n_backfill_max = n_backfill_max
+        self.backfill_cpu_factor = backfill_cpu_factor
+        self.backfill_mem_factor = backfill_mem_factor
 
         try:
             self.nice_default = os.nice(0)
@@ -313,9 +317,13 @@ class ResourceManager:
     def fits_backfill(
         self,
         res: TaskResources,
-        cpu_factor: float = 1.5,
-        mem_factor: float = 1.5,
+        cpu_factor: float = None,
+        mem_factor: float = None,
     ) -> bool:
+        if cpu_factor is None:
+            cpu_factor = self.backfill_cpu_factor
+        if mem_factor is None:
+            mem_factor = self.backfill_mem_factor
         if self.n_procs_backfill >= self.n_backfill_max:
             return False
         # don't backfill with huge tasks (originals: avoid tasks too close to limit)

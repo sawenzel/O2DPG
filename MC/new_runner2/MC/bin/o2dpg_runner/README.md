@@ -148,6 +148,8 @@ The tests cover:
 - `test_executor_e2e.py` — the tiny fixture workflow driven end-to-end
   with real subprocesses, exercising each policy, `--dry-run`,
   `--produce-script`, rerun-from-cache behavior.
+- `test_simulator.py` — simulator-only coverage for Amdahl-derived
+  critical-path weights and unschedulable-task handling.
 
 Integration test (from the prototype, still valid):
 ```bash
@@ -181,3 +183,18 @@ The metric logs have the same schema as before (`o2dpg_sim_metrics.py`
 post-processing is unaffected), plus the run's meta line now records
 `scheduler_policy`, `drop_should_break`, and `cache_policy` for easy
 downstream grouping.
+
+## Simulator notes
+
+`MC/bin/o2dpg_schedule_simulator.py` is an offline discrete-event model
+of the runner. It exists to compare policies and tune worker-count /
+resource parameters quickly, not to emulate Linux scheduling perfectly.
+
+- The simulator now uses the same walltime-weighted critical-path input
+  as the runner when learned `resources.walltime` data is available.
+- Amdahl worker overrides are applied before simulator scheduler-state
+  construction, so optimization runs evaluate policies against the same
+  task costs they simulate.
+- Tasks that exceed the hard simulated CPU/MEM limits are kept in the
+  workflow model and reported as unschedulable, rather than being
+  dropped from resource bookkeeping.
