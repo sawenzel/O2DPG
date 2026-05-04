@@ -329,3 +329,83 @@ def update_resource_estimates(
         "Resource update done: %d/%d task stages updated (%d base name(s) not in learned data).",
         n_updated, n_stages, len(missing_base_names),
     )
+
+
+def replicate_workflow_for_timeframes(raw_spec: Dict[str, Any], M: int) -> Dict[str, Any]:
+    """Return a synthetic M-timeframe workflow derived from *raw_spec*.
+
+    The original workflow may have N timeframes.  This function:
+      1. Detects per-TF stages (``timeframe >= 1``) and uses the
+         lowest-numbered timeframe as the canonical template.
+      2. Instantiates the template for TF=1..M.
+      3. Updates global stage dependencies so they reference exactly TF=1..M.
+
+    Works for both M < N (shrink) and M > N (expand).
+    The returned dict shares no mutable state with *raw_spec*.
+    """
+    stages = raw_spec.get("stages", [])
+    per_tf = [s for s in stages if s.get("timeframe", -1) >= 1]
+    global_stgs = [s for s in stages if s.get("timeframe", -1) < 1]
+
+    if not per_tf:
+        return raw_spec  # no per-TF template structure detected
+
+    original_tf_set = {s["timeframe"] for s in per_tf}
+    min_tf = min(original_tf_set)
+    template_stages = [s for s in per_tf if s.get("timeframe") == min_tf]
+    template_names = {s["name"] for s in template_stages}
+    all_per_tf_names = {s["name"] for s in per_tf}
+
+    def _base(name: str, tf: int) -> str:
+        sfx = f"_{tf}"
+        return name[:-len(sfx)] if name.endswith(sfx) else name
+
+    # Replicate per-TF tasks for i = 1 .. M.
+    new_per_tf: List[Dict[str, Any]] = []
+    for i in range(1, M + 1):
+        for tmpl in template_stages:
+            s = copy.deepcopy(tmpl)
+            base = _base(s["name"], min_tf)
+            s["name"] = f"{base}_{i}"
+            s["timeframe"] = i
+            new_needs: List[str] = []
+            for need in tmpl.get("needs", []):
+                if need in template_names:
+                    new_needs.append(f"{_base(need, min_tf)}_{i}")
+                else:
+                    new_needs.append(need)
+            s["needs"] = new_needs
+            new_per_tf.append(s)
+
+    # Update global stages: replace all per-TF deps with the full 1..M set,
+    # expanding each unique base name exactly once (deduplicates cross-TF refs).
+    new_global: List[Dict[str, Any]] = []
+    for gstage in global_stgs:
+        s = copy.deepcopy(gstage)
+        new_needs_g: List[str] = []
+        seen: Set[str] = set()
+        expanded_bases: Set[str] = set()
+        for need in gstage.get("needs", []):
+            if need not in all_per_tf_names:
+                if need not in seen:
+                    new_needs_g.append(need)
+                    seen.add(need)
+                continue
+            # Identify the base name (strip whichever TF suffix this entry has).
+            base = need
+            for otf in original_tf_set:
+                if need.endswith(f"_{otf}"):
+                    base = need[:-len(f"_{otf}")]
+                    break
+            if base in expanded_bases:
+                continue
+            expanded_bases.add(base)
+            for j in range(1, M + 1):
+                n = f"{base}_{j}"
+                if n not in seen:
+                    new_needs_g.append(n)
+                    seen.add(n)
+        s["needs"] = new_needs_g
+        new_global.append(s)
+
+    return {**raw_spec, "stages": new_per_tf + new_global}

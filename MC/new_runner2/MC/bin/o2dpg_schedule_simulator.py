@@ -54,7 +54,12 @@ _here = os.path.dirname(os.path.abspath(__file__))
 if _here not in sys.path:
     sys.path.insert(0, _here)
 
-from o2dpg_runner.workflow import build_workflow, load_json, update_resource_estimates
+from o2dpg_runner.workflow import (
+    build_workflow,
+    load_json,
+    replicate_workflow_for_timeframes,
+    update_resource_estimates,
+)
 from o2dpg_runner.resources import ResourceManager, ResourceLimitExceeded
 from o2dpg_runner.scheduler import get_policy
 from o2dpg_runner.scheduler.base import SchedulerState
@@ -516,6 +521,57 @@ def print_verbose(result: SimResult) -> None:
     print(f"  Makespan: {_fmt_time(result.makespan)}")
 
 
+def _print_sweep_table(
+    sweep_results: "List[Tuple]",   # (M, results_by_policy, n_stages, worker_assignment|None)
+    cpu_limit: float,
+    n_samples: int,
+) -> None:
+    """Print a compact table summarising a timeframe-sweep simulation run."""
+    stoch = n_samples > 1
+
+    # Collect all scalable task names that appear in any worker assignment.
+    scalable_names: List[str] = []
+    seen_names: "Set[str]" = set()
+    for _, _, _, wa in sweep_results:
+        if wa:
+            for name in sorted(wa):
+                if name not in seen_names:
+                    scalable_names.append(name)
+                    seen_names.add(name)
+
+    # Build header with optional per-task worker columns.
+    worker_cols = "  ".join(f"{n[:12]:>12}" for n in scalable_names)
+    hdr = (f"  {'M':>4}  {'Policy':<16}  {'N tasks':>7}  "
+           f"{'Makespan':>12}  {'CPU util':>9}  {'Peak mem':>9}"
+           + (f"  {worker_cols}" if scalable_names else ""))
+    print("\nTimeframe sweep results:")
+    print(hdr)
+    print("  " + "-" * (len(hdr) - 2))
+
+    for M, results_by_policy, n_stages, worker_assignment in sweep_results:
+        m_str = str(M) if M is not None else "orig"
+        for policy, runs in results_by_policy.items():
+            makespans = [r.makespan for r in runs]
+            mean_mk = statistics.mean(makespans)
+            util_pct = statistics.mean(r.cpu_utilization(cpu_limit) * 100 for r in runs)
+            peak = statistics.mean(r.peak_mem_mb() for r in runs)
+            if stoch and len(runs) > 1:
+                std_mk = statistics.stdev(makespans)
+                mk_str = f"{_fmt_time(mean_mk)}±{_fmt_time(std_mk)}"
+            else:
+                mk_str = _fmt_time(mean_mk)
+            row = (f"  {m_str:>4}  {policy:<16}  {n_stages:>7}  "
+                   f"{mk_str:>12}  {util_pct:>8.1f}%  {peak:>7.0f}MB")
+            if scalable_names and worker_assignment:
+                wvals = "  ".join(
+                    f"{worker_assignment.get(n, '-'):>12}"
+                    for n in scalable_names
+                )
+                row += f"  {wvals}"
+            print(row)
+    print()
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -669,6 +725,11 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Print per-task schedule for each policy.")
     p.add_argument("--output", default=None, metavar="FILE",
                    help="Write results as JSON to FILE.")
+    p.add_argument("--timeframes", type=int, nargs="+", default=None, metavar="M",
+                   help="Simulate with M timeframes instead of the workflow's original count. "
+                        "Detects the per-TF template structure automatically and replicates it. "
+                        "Pass multiple values for a sweep (e.g. --timeframes 1 2 5 10 20) to "
+                        "produce a table of makespan and CPU utilisation vs timeframe count.")
     return p
 
 
@@ -677,57 +738,23 @@ def main(argv=None) -> int:
 
     raw = load_json(ns.workflowfile)
     target_tasks = [t.strip('"').strip("'") for t in ns.target_tasks]
-    wf = build_workflow(raw, target_tasks, ns.target_labels)
-    if not wf.stages:
-        print("Workflow is empty after filtering.")
-        return 1
 
-    # Load walltime std for stochastic mode.
+    # ── Load learned JSON once (independent of timeframe count) ──────────────
     walltime_stds: Dict[str, float] = {}
+    learned_full: Dict = {}
+    amdahl_models: Dict[str, AmdahlModel] = {}
+
     if ns.update_resources:
         print(f"Applying learned resources from {ns.update_resources} ...")
-        update_resource_estimates(wf, ns.update_resources)
-        has_wt = sum(1 for t in wf.stages if t.get("resources", {}).get("walltime"))
-        print(f"  {has_wt}/{len(wf.stages)} tasks have learned walltime.")
-        if ns.samples > 1:
-            with open(ns.update_resources) as fh:
-                learned = json.load(fh)
-            for name, data in learned.items():
-                if name == "count":
-                    continue
-                std = data.get("lifetime", {}).get("std", 0.0) or 0.0
-                if std > 0:
-                    walltime_stds[name] = float(std)
-            print(f"  {len(walltime_stds)} tasks have walltime std for stochastic sampling.")
-    else:
-        print(f"No learned resources; using cpu * {ns.walltime_per_core}s as walltime proxy.")
-
-    # Stochastic mode activates whenever --samples > 1, regardless of whether
-    # learned stds are present.  Tasks without std use cv_fallback as noise.
-    stochastic = ns.samples > 1
-    if stochastic:
-        n_with_std = len(walltime_stds)
-        n_fallback = len(wf.stages) - n_with_std
-        print(f"  Stochastic: {n_with_std} tasks use learned std, "
-              f"{n_fallback} use cv_fallback={ns.cv_fallback:.2f}.")
-    print(f"Workflow: {len(wf.stages)} tasks, cpu_limit={ns.cpu_limit}, "
-          f"mem_limit={ns.mem_limit} MB, samples={ns.samples}"
-          + (" (stochastic)" if stochastic else " (deterministic)") + "\n")
-    if ns.backfill_model != "off":
-        print(
-            "Backfill simulation: "
-            f"model={ns.backfill_model}, n_backfill={ns.n_backfill}, "
-            f"cpu_factor={ns.backfill_cpu_factor}, mem_factor={ns.backfill_mem_factor}, "
-            f"slowdown={ns.backfill_slowdown_factor:.2f}x\n"
-        )
-
-    # Load Amdahl models from learned.json (present when json-stat --workflow was used).
-    amdahl_models: Dict[str, AmdahlModel] = {}
-    learned_full: Dict = {}
-    if ns.update_resources:
         with open(ns.update_resources) as fh:
             learned_full = json.load(fh)
         for name, data in learned_full.items():
+            if name == "count":
+                continue
+            if ns.samples > 1:
+                std = data.get("lifetime", {}).get("std", 0.0) or 0.0
+                if std > 0:
+                    walltime_stds[name] = float(std)
             if isinstance(data, dict) and "amdahl" in data:
                 try:
                     amdahl_models[name] = AmdahlModel.from_dict(data["amdahl"])
@@ -736,23 +763,40 @@ def main(argv=None) -> int:
         if amdahl_models:
             print(f"  Amdahl models loaded for {len(amdahl_models)} scalable task(s): "
                   f"{', '.join(sorted(amdahl_models))}")
-            if ns.verbose:
-                print()
-                for name, model in sorted(amdahl_models.items()):
-                    n_cur = max(model.min_workers,
-                                min(model.max_workers, max(1, round(model.cpu_mean_ref))))
-                    print(f"  Amdahl: {name}  "
-                          f"(n_ref={model.n_ref}, cpu_mean={model.cpu_mean_ref:.2f}, "
-                          f"t_serial={model.t_serial:.1f}s, "
-                          f"t_parallel_tot={model.t_parallel_tot:.1f}s)")
-                    print(f"    {'n':>4}  {'walltime':>10}  {'Δ vs current':>14}")
-                    wt_cur = model.walltime(n_cur)
-                    for n in model.worker_range:
-                        wt = model.walltime(n)
-                        marker = " ← current" if n == n_cur else ""
-                        print(f"    {n:>4}  {_fmt_time(wt):>10}  "
-                              f"{wt - wt_cur:>+12.1f}s{marker}")
-                    print()
+    else:
+        print(f"No learned resources; using cpu * {ns.walltime_per_core}s as walltime proxy.")
+
+    stochastic = ns.samples > 1
+    if stochastic:
+        n_with_std = len(walltime_stds)
+        print(f"  Stochastic: {n_with_std} tasks use learned std, "
+              f"cv_fallback={ns.cv_fallback:.2f} for the rest.")
+    if ns.backfill_model != "off":
+        print(
+            "Backfill simulation: "
+            f"model={ns.backfill_model}, n_backfill={ns.n_backfill}, "
+            f"cpu_factor={ns.backfill_cpu_factor}, mem_factor={ns.backfill_mem_factor}, "
+            f"slowdown={ns.backfill_slowdown_factor:.2f}x\n"
+        )
+
+    # Verbose Amdahl model summary (shown once, outside the sweep loop).
+    if amdahl_models and ns.verbose:
+        print()
+        for name, model in sorted(amdahl_models.items()):
+            n_cur = max(model.min_workers,
+                        min(model.max_workers, max(1, round(model.cpu_mean_ref))))
+            print(f"  Amdahl: {name}  "
+                  f"(n_ref={model.n_ref}, cpu_mean={model.cpu_mean_ref:.2f}, "
+                  f"t_serial={model.t_serial:.1f}s, "
+                  f"t_parallel_tot={model.t_parallel_tot:.1f}s)")
+            print(f"    {'n':>4}  {'walltime':>10}  {'Δ vs current':>14}")
+            wt_cur = model.walltime(n_cur)
+            for n in model.worker_range:
+                wt = model.walltime(n)
+                marker = " ← current" if n == n_cur else ""
+                print(f"    {n:>4}  {_fmt_time(wt):>10}  "
+                      f"{wt - wt_cur:>+12.1f}s{marker}")
+            print()
 
     # Resolve maxjobs — must come before optimizer and policy loops.
     # -j -1 → serial + n_ref workers  -j 1 → serial + round(cpu_mean) workers
@@ -763,89 +807,10 @@ def main(argv=None) -> int:
         print("Serial mode (-j -1): reproducing learning-run conditions "
               "(1 task at a time, n_ref workers per scalable task).")
 
-    # Worker-count optimizer (--optimize-workers).
-    # opt_results: list of (policy_name, assignment, makespan) for write-back.
-    opt_results: List[Tuple[str, Dict[str, int], float]] = []
-    if ns.optimize_workers:
-        if not amdahl_models:
-            print("WARNING: --optimize-workers requires Amdahl models in learned.json. "
-                  "Re-run json-stat with --workflow workflow.json first.", file=sys.stderr)
-        else:
-            print(f"\nOptimizing worker assignment over {len(amdahl_models)} scalable task(s)...")
-            for policy_name in ns.policies:
-                best_asgn, best_mk = optimize_workers(
-                    wf, policy_name, ns.cpu_limit, ns.mem_limit,
-                    amdahl_models=amdahl_models,
-                    cpu_fallback_factor=ns.walltime_per_core,
-                    task_overhead=ns.task_overhead,
-                    n_eval_samples=ns.opt_eval_samples,
-                    backfill_model=ns.backfill_model,
-                    n_backfill=ns.n_backfill,
-                    backfill_cpu_factor=ns.backfill_cpu_factor,
-                    backfill_mem_factor=ns.backfill_mem_factor,
-                    backfill_slowdown_factor=ns.backfill_slowdown_factor,
-                    maxjobs=procs_limit,
-                )
-                opt_results.append((policy_name, best_asgn, best_mk))
-                print(f"\n  [{policy_name}] best makespan: {_fmt_time(best_mk)}")
-                print(f"  {'Task':<35} {'n_ref':>6} {'current':>8} {'→ opt':>6}  "
-                      f"{'wt(current)':>12}  {'wt(opt)':>10}  {'Δwt':>8}")
-                print(f"  {'-'*85}")
-                for name, model in sorted(amdahl_models.items()):
-                    n_cur = max(model.min_workers,
-                                min(model.max_workers, max(1, round(model.cpu_mean_ref))))
-                    n_opt = best_asgn[name]
-                    wt_cur = model.walltime(n_cur)
-                    wt_opt = model.walltime(n_opt)
-                    delta = wt_opt - wt_cur
-                    changed = "←" if n_opt != n_cur else ""
-                    print(f"  {name:<35} {model.n_ref:>6} {n_cur:>8} {n_opt:>6}  "
-                          f"{_fmt_time(wt_cur):>12}  {_fmt_time(wt_opt):>10}  "
-                          f"{delta:>+7.1f}s  {changed}")
-            print()
-
-        # Write optimized learned.json if requested.
-        if ns.write_optimized and opt_results:
-            best_policy, best_asgn, best_mk = min(opt_results, key=lambda x: x[2])
-            if len(ns.policies) > 1:
-                print(f"Writing optimized resources: policy '{best_policy}' "
-                      f"selected (best makespan {_fmt_time(best_mk)}).")
-            else:
-                print(f"Writing optimized resources (makespan {_fmt_time(best_mk)}).")
-            out_learned = copy.deepcopy(learned_full)
-            n_changed = 0
-            for name, model in amdahl_models.items():
-                if name not in out_learned:
-                    continue
-                n_opt = best_asgn[name]
-                n_cur = max(model.min_workers,
-                            min(model.max_workers, max(1, round(model.cpu_mean_ref))))
-                # Update lifetime.mean to Amdahl-predicted walltime at n_opt.
-                if "lifetime" not in out_learned[name]:
-                    out_learned[name]["lifetime"] = {}
-                out_learned[name]["lifetime"]["mean"] = round(model.walltime(n_opt), 3)
-                # Update cpu.mean to n_opt so update_resource_estimates rounds it
-                # to n_opt workers and sets O2DPG_DYNAMIC_NWORKER_OVERWRITE accordingly.
-                if "cpu" not in out_learned[name]:
-                    out_learned[name]["cpu"] = {}
-                out_learned[name]["cpu"]["mean"] = float(n_opt)
-                if n_opt != n_cur:
-                    n_changed += 1
-            with open(ns.write_optimized, "w") as fh:
-                json.dump(out_learned, fh, indent=2)
-            print(f"  Wrote {ns.write_optimized}  "
-                  f"({len(amdahl_models)} scalable tasks updated, "
-                  f"{n_changed} changed from current assignment).")
-
-    # Default worker assignment: round(cpu_mean) per scalable task.
-    # When Amdahl models are available, the policy-comparison simulations
-    # use this assignment so walltimes are Amdahl-predicted at the current
-    # worker count rather than the n_ref walltime from the learning run.
-    # This makes the default and optimizer evaluations directly comparable.
+    # Default worker assignment: Amdahl-based, same for all M values in a sweep.
     default_worker_assignment: Optional[Dict[str, int]] = None
     if amdahl_models:
         if serial_mode:
-            # Serial mode: use n_ref workers so walltime(n_ref) = measured walltime exactly.
             default_worker_assignment = {name: m.n_ref for name, m in amdahl_models.items()}
             parts = [f"{n}: {w}w (n_ref)" for n, w in sorted(default_worker_assignment.items())]
         else:
@@ -856,52 +821,191 @@ def main(argv=None) -> int:
             parts = [f"{n}: {w}w" for n, w in sorted(default_worker_assignment.items())]
         print(f"Worker counts for simulation: {', '.join(parts)}\n")
 
-    results_by_policy: Dict[str, List[SimResult]] = {}
-    for policy_name in ns.policies:
-        runs: List[SimResult] = []
-        for s in range(ns.samples):
-            rng = random.Random(s) if stochastic else None
-            r = simulate(
-                wf, policy_name,
-                cpu_limit=ns.cpu_limit,
-                mem_limit=ns.mem_limit,
-                cpu_fallback_factor=ns.walltime_per_core,
-                task_overhead=ns.task_overhead,
-                walltime_stds=walltime_stds,
-                cv_fallback=ns.cv_fallback,
-                rng=rng,
-                amdahl_models=amdahl_models if amdahl_models else None,
-                worker_assignment=default_worker_assignment,
-                backfill_model=ns.backfill_model,
-                n_backfill=ns.n_backfill,
-                backfill_cpu_factor=ns.backfill_cpu_factor,
-                backfill_mem_factor=ns.backfill_mem_factor,
-                backfill_slowdown_factor=ns.backfill_slowdown_factor,
-                maxjobs=procs_limit,
+    # ── Timeframe sweep ───────────────────────────────────────────────────────
+    tf_list: List[Optional[int]] = sorted(set(ns.timeframes)) if ns.timeframes else [None]
+    sweep_mode = len(tf_list) > 1
+    if sweep_mode:
+        print(f"Timeframe sweep: M={tf_list}  policies={ns.policies}  "
+              f"cpu_limit={ns.cpu_limit}  mem_limit={ns.mem_limit} MB\n")
+
+    all_sweep_results: List[Tuple] = []   # (M, results_by_policy, n_stages, worker_assignment)
+    last_opt_results: List[Tuple[str, Dict[str, int], float]] = []
+
+    for M in tf_list:
+        if sweep_mode:
+            print(f"  M={M} ...", end=" ", flush=True)
+
+        cur_raw = replicate_workflow_for_timeframes(raw, M) if M is not None else raw
+        wf = build_workflow(cur_raw, target_tasks, ns.target_labels)
+        if not wf.stages:
+            print(f"Workflow is empty after filtering (M={M}).")
+            continue
+
+        if ns.update_resources:
+            update_resource_estimates(wf, ns.update_resources)
+            has_wt = sum(1 for t in wf.stages if t.get("resources", {}).get("walltime"))
+            if not sweep_mode:
+                print(f"  {has_wt}/{len(wf.stages)} tasks have learned walltime.")
+                if stochastic:
+                    n_fallback = len(wf.stages) - len(walltime_stds)
+                    print(f"  Stochastic: {len(walltime_stds)} tasks use learned std, "
+                          f"{n_fallback} use cv_fallback={ns.cv_fallback:.2f}.")
+        if not sweep_mode:
+            print(f"Workflow: {len(wf.stages)} tasks, cpu_limit={ns.cpu_limit}, "
+                  f"mem_limit={ns.mem_limit} MB, samples={ns.samples}"
+                  + (" (stochastic)" if stochastic else " (deterministic)") + "\n")
+
+        # Worker-count optimizer (--optimize-workers): runs per-M so that the
+        # simulated workflow matches the actual task count.
+        cur_worker_assignment = default_worker_assignment
+        opt_results: List[Tuple[str, Dict[str, int], float]] = []
+        if ns.optimize_workers:
+            if not amdahl_models:
+                print("WARNING: --optimize-workers requires Amdahl models in learned.json. "
+                      "Re-run json-stat with --workflow workflow.json first.", file=sys.stderr)
+            else:
+                if not sweep_mode:
+                    print(f"\nOptimizing worker assignment over "
+                          f"{len(amdahl_models)} scalable task(s)...")
+                for policy_name in ns.policies:
+                    best_asgn, best_mk = optimize_workers(
+                        wf, policy_name, ns.cpu_limit, ns.mem_limit,
+                        amdahl_models=amdahl_models,
+                        cpu_fallback_factor=ns.walltime_per_core,
+                        task_overhead=ns.task_overhead,
+                        n_eval_samples=ns.opt_eval_samples,
+                        backfill_model=ns.backfill_model,
+                        n_backfill=ns.n_backfill,
+                        backfill_cpu_factor=ns.backfill_cpu_factor,
+                        backfill_mem_factor=ns.backfill_mem_factor,
+                        backfill_slowdown_factor=ns.backfill_slowdown_factor,
+                        maxjobs=procs_limit,
+                    )
+                    opt_results.append((policy_name, best_asgn, best_mk))
+                    if not sweep_mode:
+                        print(f"\n  [{policy_name}] best makespan: {_fmt_time(best_mk)}")
+                        print(f"  {'Task':<35} {'n_ref':>6} {'current':>8} {'→ opt':>6}  "
+                              f"{'wt(current)':>12}  {'wt(opt)':>10}  {'Δwt':>8}")
+                        print(f"  {'-'*85}")
+                        for name, model in sorted(amdahl_models.items()):
+                            n_cur = max(model.min_workers,
+                                        min(model.max_workers, max(1, round(model.cpu_mean_ref))))
+                            n_opt = best_asgn[name]
+                            wt_cur = model.walltime(n_cur)
+                            wt_opt = model.walltime(n_opt)
+                            delta = wt_opt - wt_cur
+                            changed = "←" if n_opt != n_cur else ""
+                            print(f"  {name:<35} {model.n_ref:>6} {n_cur:>8} {n_opt:>6}  "
+                                  f"{_fmt_time(wt_cur):>12}  {_fmt_time(wt_opt):>10}  "
+                                  f"{delta:>+7.1f}s  {changed}")
+                if not sweep_mode:
+                    print()
+                _, best_asgn_opt, _ = min(opt_results, key=lambda x: x[2])
+                cur_worker_assignment = best_asgn_opt
+                last_opt_results = opt_results
+
+        # ── Run simulations ───────────────────────────────────────────────────
+        results_by_policy: Dict[str, List[SimResult]] = {}
+        for policy_name in ns.policies:
+            runs: List[SimResult] = []
+            for s in range(ns.samples):
+                rng = random.Random(s) if stochastic else None
+                r = simulate(
+                    wf, policy_name,
+                    cpu_limit=ns.cpu_limit,
+                    mem_limit=ns.mem_limit,
+                    cpu_fallback_factor=ns.walltime_per_core,
+                    task_overhead=ns.task_overhead,
+                    walltime_stds=walltime_stds,
+                    cv_fallback=ns.cv_fallback,
+                    rng=rng,
+                    amdahl_models=amdahl_models if amdahl_models else None,
+                    worker_assignment=cur_worker_assignment,
+                    backfill_model=ns.backfill_model,
+                    n_backfill=ns.n_backfill,
+                    backfill_cpu_factor=ns.backfill_cpu_factor,
+                    backfill_mem_factor=ns.backfill_mem_factor,
+                    backfill_slowdown_factor=ns.backfill_slowdown_factor,
+                    maxjobs=procs_limit,
+                )
+                runs.append(r)
+            results_by_policy[policy_name] = runs
+            if not sweep_mode:
+                makespans = [r.makespan for r in runs]
+                summary = _fmt_time(statistics.mean(makespans))
+                if stochastic:
+                    summary += f" ± {_fmt_time(statistics.stdev(makespans))}"
+                print(f"  {policy_name:<16} makespan={summary}")
+
+        all_sweep_results.append((M, results_by_policy, len(wf.stages), cur_worker_assignment))
+
+        if sweep_mode:
+            best_mk = min(
+                statistics.mean(r.makespan for r in runs)
+                for runs in results_by_policy.values()
             )
-            runs.append(r)
-        results_by_policy[policy_name] = runs
-        makespans = [r.makespan for r in runs]
-        summary = _fmt_time(statistics.mean(makespans))
-        if stochastic:
-            summary += f" ± {_fmt_time(statistics.stdev(makespans))}"
-        print(f"  {policy_name:<16} makespan={summary}")
+            print(f"{len(wf.stages)} tasks, best makespan={_fmt_time(best_mk)}")
 
-    print_summary(results_by_policy, ns.cpu_limit, ns.samples)
+    if not all_sweep_results:
+        return 1
 
-    if ns.verbose:
-        for policy_name, runs in results_by_policy.items():
-            print_verbose(runs[0])   # verbose shows first (or only) sample
+    # ── Summary ───────────────────────────────────────────────────────────────
+    if sweep_mode:
+        _print_sweep_table(all_sweep_results, ns.cpu_limit, ns.samples)
+    else:
+        _, results_by_policy, _, _ = all_sweep_results[0]
+        print_summary(results_by_policy, ns.cpu_limit, ns.samples)
+        if ns.verbose:
+            for policy_name, runs in results_by_policy.items():
+                print_verbose(runs[0])
 
+    # ── Write optimized learned.json ──────────────────────────────────────────
+    if ns.write_optimized and last_opt_results and learned_full:
+        if sweep_mode:
+            print(f"NOTE: --write-optimized in sweep mode writes the optimisation "
+                  f"result from the last M={tf_list[-1]}.")
+        best_policy, best_asgn, best_mk = min(last_opt_results, key=lambda x: x[2])
+        if len(ns.policies) > 1:
+            print(f"Writing optimized resources: policy '{best_policy}' "
+                  f"selected (best makespan {_fmt_time(best_mk)}).")
+        else:
+            print(f"Writing optimized resources (makespan {_fmt_time(best_mk)}).")
+        out_learned = copy.deepcopy(learned_full)
+        n_changed = 0
+        for name, model in amdahl_models.items():
+            if name not in out_learned:
+                continue
+            n_opt = best_asgn[name]
+            n_cur = max(model.min_workers,
+                        min(model.max_workers, max(1, round(model.cpu_mean_ref))))
+            if "lifetime" not in out_learned[name]:
+                out_learned[name]["lifetime"] = {}
+            out_learned[name]["lifetime"]["mean"] = round(model.walltime(n_opt), 3)
+            if "cpu" not in out_learned[name]:
+                out_learned[name]["cpu"] = {}
+            out_learned[name]["cpu"]["mean"] = float(n_opt)
+            if n_opt != n_cur:
+                n_changed += 1
+        with open(ns.write_optimized, "w") as fh:
+            json.dump(out_learned, fh, indent=2)
+        print(f"  Wrote {ns.write_optimized}  "
+              f"({len(amdahl_models)} scalable tasks updated, "
+              f"{n_changed} changed from current assignment).")
+
+    # ── JSON output ───────────────────────────────────────────────────────────
     if ns.output:
-        out = []
-        for policy_name, runs in results_by_policy.items():
-            for i, r in enumerate(runs):
-                d = r.to_dict()
-                d["sample"] = i
-                out.append(d)
+        out_list = []
+        for M, results_by_policy, n_stages, _ in all_sweep_results:
+            for policy_name, runs in results_by_policy.items():
+                for i, r in enumerate(runs):
+                    d = r.to_dict()
+                    d["sample"] = i
+                    d["n_stages"] = n_stages
+                    if M is not None:
+                        d["timeframes"] = M
+                    out_list.append(d)
         with open(ns.output, "w") as fh:
-            json.dump(out, fh, indent=2)
+            json.dump(out_list, fh, indent=2)
         print(f"Results written to {ns.output}")
 
     return 0
