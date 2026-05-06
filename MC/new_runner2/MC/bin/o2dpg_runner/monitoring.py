@@ -334,16 +334,20 @@ class MonitorThread(threading.Thread):
         # the "iter" field reflects wall-clock ticks like the prototype did.
         self.tick: int = 0
 
-        # Opportunistic cgroup v2 global monitor.  When the runner is inside a
-        # systemd slice the caller should pass the *slice* directory (parent of
-        # the runner's own scope) so the global numbers cover all sibling task
-        # scopes too.  Falls back to the runner's own cgroup when not given.
+        # Opportunistic cgroup v2 global monitor.  Only enabled when the
+        # caller passes an explicit *slice* directory (i.e. the runner was
+        # launched under --systemd-run).  Without an explicit directory we
+        # skip cgroup monitoring entirely — the runner's own cgroup outside a
+        # dedicated slice covers unrelated user-session processes and gives
+        # misleading aggregates.
         # Written only from the monitor thread; read from the executor thread —
         # GIL makes bare float/None assignment atomic.
-        self._cgroup = CgroupV2Monitor(cgroup_dir=global_cgroup_dir)
+        self._cgroup: Optional[CgroupV2Monitor] = (
+            CgroupV2Monitor(cgroup_dir=global_cgroup_dir) if global_cgroup_dir else None
+        )
         self.global_cpu_pct: Optional[float] = None  # cgroup-aggregate CPU %
         self.global_mem_mb: Optional[float] = None   # cgroup-aggregate memory MB
-        if self._cgroup.available:
+        if self._cgroup is not None and self._cgroup.available:
             log.info("CgroupV2Monitor global active at %s", self._cgroup._cgroup_dir)
 
     # ----- registration -----
@@ -406,7 +410,7 @@ class MonitorThread(threading.Thread):
         self.tick += 1
 
         # cgroup global totals (cheap reads, always done every pass)
-        if self._cgroup.available:
+        if self._cgroup is not None and self._cgroup.available:
             g_cpu, g_mem = self._cgroup.sample()
             if g_cpu is not None:
                 self.global_cpu_pct = g_cpu

@@ -154,19 +154,21 @@ class WorkflowExecutor:
         self._init_alternative_envs()
 
         # Compute the global cgroup directory for the aggregate monitor.
-        # When running inside a systemd slice the runner's own scope is a leaf
-        # node (e.g. o2dpg.slice/o2dpg-runner-<pid>.scope/) and task scopes are
-        # siblings.  We need the *parent* slice directory so cpu.stat and
-        # memory.current cover the runner + all task scopes.  Outside a slice
-        # the runner and its children share one cgroup, so the runner's own dir
-        # is correct.
-        _runner_cgroup = _read_cgroup_v2_dir(os.getpid())
-        if config.in_systemd_slice and _runner_cgroup:
-            _global_cgroup = os.path.dirname(_runner_cgroup)
-            if not os.path.isdir(_global_cgroup):
-                _global_cgroup = _runner_cgroup  # safety fallback
-        else:
-            _global_cgroup = _runner_cgroup
+        # Cgroup monitoring is only meaningful when the runner was launched
+        # under --systemd-run: the runner's own scope is a leaf node
+        # (e.g. o2dpg.slice/o2dpg-runner-<pid>.scope/) and task scopes are
+        # siblings.  The *parent* slice directory's cpu.stat / memory.current
+        # then cover the runner + all task scopes.  Without --systemd-run the
+        # runner shares a generic user-session cgroup with unrelated
+        # processes, so cgroup readings would be misleading; fall back to
+        # plain psutil monitoring instead.
+        _global_cgroup: Optional[str] = None
+        if config.in_systemd_slice:
+            _runner_cgroup = _read_cgroup_v2_dir(os.getpid())
+            if _runner_cgroup:
+                _global_cgroup = os.path.dirname(_runner_cgroup)
+                if not os.path.isdir(_global_cgroup):
+                    _global_cgroup = _runner_cgroup  # safety fallback
 
         # monitor
         self.monitor = MonitorThread(
