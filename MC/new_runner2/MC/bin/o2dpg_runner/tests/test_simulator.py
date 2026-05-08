@@ -88,6 +88,9 @@ def test_simulator_backfill_slowdown_marks_and_slows_backfill_tasks():
     assert "big" in by_name
     assert by_name["big"].start == pytest.approx(0.0)
     assert by_name["big"].walltime == pytest.approx(8.0 * 1.25 + 0.1)
+    assert by_name["big"].cpu == pytest.approx(3.0 / 1.25)
+    assert by_name["big"].cpu_booked == pytest.approx(3.0)
+    assert result.cpu_utilization(4.0) <= 1.0
 
 
 def test_amdahl_model_rejects_negative_components():

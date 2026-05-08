@@ -77,7 +77,8 @@ class SimTask:
     name: str
     start: float       # wall seconds from t=0
     finish: float
-    cpu: float         # cores booked
+    cpu: float         # effective average cores consumed over [start, finish]
+    cpu_booked: float  # cores booked for scheduler admission
     mem: float         # MB booked
     walltime: float    # finish - start
 
@@ -117,7 +118,8 @@ class SimResult:
                 {
                     "tid": t.tid, "name": t.name,
                     "start": round(t.start, 3), "finish": round(t.finish, 3),
-                    "cpu": round(t.cpu, 3), "mem": round(t.mem, 1),
+                    "cpu": round(t.cpu, 3), "cpu_booked": round(t.cpu_booked, 3),
+                    "mem": round(t.mem, 1),
                     "walltime": round(t.walltime, 3),
                 }
                 for t in sorted(self.tasks, key=lambda x: x.start)
@@ -416,12 +418,14 @@ def simulate(
             candidates.remove(tid)
             proc_status[tid] = "Running"
             res = rm.resources[tid]
+            effective_cpu = res.cpu_assigned / slowdown
             result.tasks.append(SimTask(
                 tid=tid,
                 name=workflow.id_to_name[tid],
                 start=t,
                 finish=finish,
-                cpu=res.cpu_assigned,
+                cpu=effective_cpu,
+                cpu_booked=res.cpu_assigned,
                 mem=res.mem_assigned,
                 walltime=wt,
             ))
@@ -516,7 +520,9 @@ def print_verbose(result: SimResult) -> None:
             print(f"  t={_fmt_time(task.start)}")
             prev_t = task.start
         print(f"    START  {task.name:<40}  "
-              f"cpu={task.cpu:.1f}  mem={task.mem:.0f}MB  "
+              f"cpu={task.cpu:.1f}"
+              + (f" ({task.cpu_booked:.1f} booked)" if abs(task.cpu - task.cpu_booked) > 1e-9 else "")
+              + f"  mem={task.mem:.0f}MB  "
               f"dur={_fmt_time(task.walltime)}")
     print(f"  Makespan: {_fmt_time(result.makespan)}")
 
