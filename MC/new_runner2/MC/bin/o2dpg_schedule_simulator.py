@@ -84,6 +84,15 @@ class SimTask:
 
 
 @dataclass
+class _RunningBackfill:
+    task: SimTask
+    nominal_work: float
+    remaining_work: float
+    launch_seq: int
+    overhead_until: Optional[float] = None
+
+
+@dataclass
 class SimResult:
     policy: str
     makespan: float                        # total wall seconds
@@ -380,7 +389,7 @@ def simulate(
     else:
         policy = get_policy(policy_name)
 
-    use_backfill = backfill_model in ("structural", "slowdown")
+    use_backfill = backfill_model in ("structural", "slowdown", "holefill")
     rm, impossible_tids = _build_rm(
         workflow,
         cpu_limit,
@@ -401,6 +410,155 @@ def simulate(
     running: List[Tuple[int, float]] = []   # (tid, finish_time)
     result = SimResult(policy=policy_name, makespan=0.0)
     t = 0.0
+
+    if backfill_model == "holefill":
+        running_fg: List[Tuple[int, float]] = []
+        running_bf: Dict[int, _RunningBackfill] = {}
+        launch_seq = 0
+
+        for _guard in range(n * n + 1):
+            ordered = policy.order(candidates, state)
+            for tid, nice in policy.pick_submittable(ordered, rm):
+                if nice != rm.nice_default and rm.cpu_free_default() <= 1e-9:
+                    continue
+                rm.book(tid, nice)
+                candidates.remove(tid)
+                proc_status[tid] = "Running"
+                res = rm.resources[tid]
+                if nice == rm.nice_default:
+                    wt = walltimes[tid] + task_overhead
+                    finish = t + wt
+                    task = SimTask(
+                        tid=tid,
+                        name=workflow.id_to_name[tid],
+                        start=t,
+                        finish=finish,
+                        cpu=res.cpu_assigned,
+                        cpu_booked=res.cpu_assigned,
+                        mem=res.mem_assigned,
+                        walltime=wt,
+                    )
+                    running_fg.append((tid, finish))
+                    result.tasks.append(task)
+                else:
+                    launch_seq += 1
+                    task = SimTask(
+                        tid=tid,
+                        name=workflow.id_to_name[tid],
+                        start=t,
+                        finish=t,
+                        cpu=0.0,
+                        cpu_booked=res.cpu_assigned,
+                        mem=res.mem_assigned,
+                        walltime=0.0,
+                    )
+                    nominal_work = res.cpu_assigned * walltimes[tid]
+                    running_bf[tid] = _RunningBackfill(
+                        task=task,
+                        nominal_work=nominal_work,
+                        remaining_work=nominal_work,
+                        launch_seq=launch_seq,
+                    )
+                    result.tasks.append(task)
+
+            if not running_fg and not running_bf:
+                break
+
+            next_fg = min((ft for _, ft in running_fg), default=float("inf"))
+            cpu_fg = sum(
+                next(task.cpu_booked for task in result.tasks if task.tid == tid)
+                for tid, _ in running_fg
+            )
+            hole_cpu = max(0.0, cpu_limit - cpu_fg)
+            remaining_hole = hole_cpu
+            bf_alloc: Dict[int, float] = {}
+            for tid, rb in sorted(running_bf.items(), key=lambda item: item[1].launch_seq):
+                if rb.overhead_until is not None:
+                    bf_alloc[tid] = 0.0
+                    continue
+                alloc = min(rb.task.cpu_booked, remaining_hole)
+                bf_alloc[tid] = alloc
+                remaining_hole -= alloc
+
+            next_bf = float("inf")
+            for tid, rb in running_bf.items():
+                if rb.overhead_until is not None:
+                    next_bf = min(next_bf, rb.overhead_until)
+                else:
+                    alloc = bf_alloc.get(tid, 0.0)
+                    if alloc > 1e-12:
+                        next_bf = min(next_bf, t + rb.remaining_work / alloc)
+
+            next_t = min(next_fg, next_bf)
+            if not math.isfinite(next_t):
+                break
+            dt = max(0.0, next_t - t)
+            for tid, rb in running_bf.items():
+                if rb.overhead_until is None:
+                    alloc = bf_alloc.get(tid, 0.0)
+                    if alloc > 0.0:
+                        rb.remaining_work = max(0.0, rb.remaining_work - alloc * dt)
+            t = next_t
+
+            new_running_fg: List[Tuple[int, float]] = []
+            for tid, ft in running_fg:
+                if abs(ft - t) < 1e-9:
+                    rm.unbook(tid)
+                    proc_status[tid] = "Done"
+                    finished.add(tid)
+                    for succ in workflow.forward_adj[tid]:
+                        if proc_status[succ] == "ToDo":
+                            if succ in impossible_tids:
+                                continue
+                            if all(p in finished for p in workflow.reverse_adj[succ]):
+                                candidates.append(succ)
+                else:
+                    new_running_fg.append((tid, ft))
+            running_fg = new_running_fg
+
+            done_bf: List[int] = []
+            for tid, rb in running_bf.items():
+                if rb.overhead_until is not None:
+                    if abs(rb.overhead_until - t) < 1e-9:
+                        done_bf.append(tid)
+                    continue
+                if rb.remaining_work <= 1e-9:
+                    if task_overhead > 0:
+                        rb.overhead_until = t + task_overhead
+                    else:
+                        done_bf.append(tid)
+
+            for tid in done_bf:
+                rb = running_bf.pop(tid)
+                rb.task.finish = t
+                rb.task.walltime = max(1e-9, rb.task.finish - rb.task.start)
+                rb.task.cpu = rb.nominal_work / rb.task.walltime
+                rm.unbook(tid)
+                proc_status[tid] = "Done"
+                finished.add(tid)
+                for succ in workflow.forward_adj[tid]:
+                    if proc_status[succ] == "ToDo":
+                        if succ in impossible_tids:
+                            continue
+                        if all(p in finished for p in workflow.reverse_adj[succ]):
+                            candidates.append(succ)
+
+            if not candidates and not running_fg and not running_bf:
+                break
+        else:
+            print(f"  WARNING [{policy_name}]: simulation hit guard limit — possible deadlock",
+                  file=sys.stderr)
+
+        result.makespan = t
+        result.deadlocked_tids = [
+            i for i, s in enumerate(proc_status) if s == "ToDo"
+        ]
+        if result.deadlocked_tids:
+            names = [workflow.id_to_name[i] for i in result.deadlocked_tids]
+            print(f"  WARNING [{policy_name}]: {len(names)} tasks never scheduled "
+                  f"(resource limits too tight?): {names[:5]}{'...' if len(names) > 5 else ''}",
+                  file=sys.stderr)
+        return result
 
     for _guard in range(n * n + 1):   # at most n rounds to completion
         # --- schedule everything that fits right now ---
@@ -685,10 +843,12 @@ def build_parser() -> argparse.ArgumentParser:
                         "effective duration (covers systemd-run scope creation, "
                         "bash/taskwrapper startup, etc.).")
     p.add_argument("--backfill-model", default="off",
-                   choices=["off", "structural", "slowdown"],
+                   choices=["off", "structural", "slowdown", "holefill"],
                    help="Backfill approximation used by the simulator. "
                         "'structural' replays the runner's second admission lane; "
-                        "'slowdown' adds a fitted walltime penalty to backfill tasks.")
+                        "'slowdown' adds a fitted walltime penalty to backfill tasks; "
+                        "'holefill' lets backfill tasks consume only the CPU left idle "
+                        "by foreground tasks, slowing them proportionally.")
     p.add_argument("--n-backfill", type=int, default=1, metavar="N",
                    help="Maximum concurrent backfill tasks when backfill simulation is enabled.")
     p.add_argument("--backfill-cpu-factor", type=float, default=1.5, metavar="X",
@@ -782,7 +942,13 @@ def main(argv=None) -> int:
             "Backfill simulation: "
             f"model={ns.backfill_model}, n_backfill={ns.n_backfill}, "
             f"cpu_factor={ns.backfill_cpu_factor}, mem_factor={ns.backfill_mem_factor}, "
-            f"slowdown={ns.backfill_slowdown_factor:.2f}x\n"
+            + (
+                f"slowdown={ns.backfill_slowdown_factor:.2f}x\n"
+                if ns.backfill_model == "slowdown"
+                else "foreground-hole driven\n"
+                if ns.backfill_model == "holefill"
+                else "\n"
+            )
         )
 
     # Verbose Amdahl model summary (shown once, outside the sweep loop).

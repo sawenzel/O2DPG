@@ -13,7 +13,7 @@ already made.
   and a threaded monitor unlock A/B measurements for the paper.
 - **Language decision:** **stay in Python**. Considered Rust/C++ but
   rejected as overkill (see "Decisions" below).
-- **Status:** v1 package written and unit-tested (65 tests passing).
+- **Status:** v1 package written and unit-tested (66 tests passing).
   Real workflow testing has begun; first run found two monitor bugs
   which were fixed (children-cache CPU=0 and iter counter stuck).
   The user is now continuing real-workflow validation.
@@ -173,14 +173,32 @@ In rough priority order:
   used for fast policy comparison and worker-count tuning.
 - It supports walltime-weighted critical path, Monte Carlo walltime
   sampling, and Amdahl-based worker-count optimization/write-back.
-- Simulated backfill now has three modes:
+- Simulated backfill now has four modes:
   - `off` — one hard budget only.
   - `structural` — second admission lane with runner-like
     `n_backfill`, CPU-factor, and MEM-factor rules.
   - `slowdown` — same structural model plus a single fitted slowdown
     multiplier for backfill tasks.
+  - `holefill` — preferred realistic model. Foreground tasks keep their
+    nominal duration; backfill tasks consume only CPU left idle by the
+    currently running foreground set and therefore slow down
+    proportionally when the hole is smaller than their nominal CPU.
 - This is deliberately not a kernel-level model of Linux `nice`; it is a
   scheduler-level approximation intended for comparative studies.
+- The holefill model was motivated by real policy-comparison runs where
+  `off` under-estimated utilisation and the one-factor `slowdown` model
+  could still drift. In realistic sweeps the user reported holefill
+  landing close to observed runtime and CPU-efficiency numbers.
+
+## Current simulator recommendation
+
+- For realistic reporting, compare:
+  - `--backfill-model off`
+  - `--backfill-model holefill`
+- Treat `slowdown` as a coarse intermediate model / control study, not
+  the preferred final one.
+- CPU efficiency from the simulator should now remain physically bounded
+  by 100%; if it does not, treat that as a simulator bug.
 
 ## Conventions and style
 

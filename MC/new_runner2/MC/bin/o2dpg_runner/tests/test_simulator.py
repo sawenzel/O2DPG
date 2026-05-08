@@ -93,6 +93,28 @@ def test_simulator_backfill_slowdown_marks_and_slows_backfill_tasks():
     assert result.cpu_utilization(4.0) <= 1.0
 
 
+def test_simulator_holefill_uses_only_foreground_hole():
+    wf = _wf([
+        _task("fg", cpu=2, walltime=4.0),
+        _task("bf", cpu=3, walltime=2.0),
+    ])
+    result = sim.simulate(
+        wf,
+        "timeframe",
+        cpu_limit=4.0,
+        mem_limit=1000.0,
+        backfill_model="holefill",
+        n_backfill=1,
+        task_overhead=0.0,
+    )
+    by_name = {t.name: t for t in result.tasks}
+    assert by_name["fg"].walltime == pytest.approx(4.0)
+    assert by_name["bf"].walltime == pytest.approx(3.0)
+    assert by_name["bf"].cpu == pytest.approx(2.0)
+    assert by_name["bf"].cpu_booked == pytest.approx(3.0)
+    assert result.cpu_utilization(4.0) == pytest.approx(0.875)
+
+
 def test_amdahl_model_rejects_negative_components():
     with pytest.raises(ValueError):
         sim.AmdahlModel.from_dict(

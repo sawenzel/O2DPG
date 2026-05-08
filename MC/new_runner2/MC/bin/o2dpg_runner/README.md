@@ -150,7 +150,7 @@ The tests cover:
   `--produce-script`, rerun-from-cache behavior.
 - `test_simulator.py` — simulator-only coverage for Amdahl-derived
   critical-path weights, unschedulable-task handling, and simulated
-  backfill behaviour.
+  backfill behaviour (`slowdown` and `holefill`).
 
 Integration test (from the prototype, still valid):
 ```bash
@@ -205,7 +205,7 @@ resource parameters quickly, not to emulate Linux scheduling perfectly.
 The real runner has a two-lane admission model: default tasks stay
 within the hard budget, while backfill tasks may use a bounded amount of
 overcommit and run at lower priority. The simulator now offers a
-"sweet-spot" approximation of that behaviour:
+"sweet-spot" family of approximations for that behaviour:
 
 - `--backfill-model off` — no backfill, one hard budget only.
 - `--backfill-model structural` — replay the runner's second admission
@@ -213,6 +213,12 @@ overcommit and run at lower priority. The simulator now offers a
   duration.
 - `--backfill-model slowdown` — same structural backfill admission, plus
   a single fitted slowdown factor applied to backfill task walltimes.
+- `--backfill-model holefill` — preferred realistic mode. Foreground
+  tasks keep their nominal duration; backfill tasks consume only the CPU
+  left idle by currently running foreground tasks. When the foreground
+  hole is smaller than the task's nominal CPU demand, the task slows
+  down proportionally. When the hole is large enough, it runs at nominal
+  speed.
 
 Relevant knobs:
 
@@ -221,6 +227,34 @@ Relevant knobs:
 - `--backfill-mem-factor`
 - `--backfill-slowdown-factor`
 
+`holefill` is the recommended mode for poster / proceedings studies: it
+keeps simulated CPU efficiency physically bounded by 100%, tracks
+observed runtime improvements from backfilling much better than the
+single-factor slowdown model, and still stays simple enough to explain.
+
+Two modelling choices are worth keeping in mind:
+
+- foreground tasks are assumed not to slow down due to backfill;
+- hole allocation is online and greedy, so enabling backfill may still
+  change the order in which later tasks become runnable.
+
 This is intentionally a scheduler-level approximation, not a kernel CPU
 sharing model. It is accurate enough for comparative studies while still
 remaining easy to reason about and calibrate against real runs.
+
+### Suggested simulator usage
+
+For realistic policy comparison, use learned resources and the holefill
+backfill model:
+
+```bash
+./o2dpg_schedule_simulator.py \
+  --timeframes 1 2 4 5 8 12 20 \
+  --update-resources learned.json \
+  -f workflow.json \
+  --backfill-model holefill
+```
+
+Use `off` as the baseline and `holefill` as the realistic backfill
+comparison. The older `slowdown` mode remains useful as a coarse control
+study, but it is no longer the preferred setting for reporting numbers.
