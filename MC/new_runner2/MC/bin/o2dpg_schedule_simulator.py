@@ -160,6 +160,45 @@ def _task_walltime(task: dict, cpu_fallback_factor: float) -> float:
     return max(1e-3, cpu * cpu_fallback_factor)
 
 
+_LEARN_ALL: Set[str] = frozenset({"cpu", "mem", "lifetime"})
+
+
+def _apply_learned_fields(workflow, learned: Dict, fields: Set[str]) -> int:
+    """Patch workflow stages in-place with a subset of learned resource fields.
+
+    *fields* is a subset of ``{"cpu", "mem", "lifetime"}``.  Only the named
+    dimensions are written; the rest keep the values from workflow.json.
+    Returns the count of stages that received at least one update.
+    """
+    n_updated = 0
+    for task in workflow.stages:
+        tf = task.get("timeframe", -1)
+        name = task["name"]
+        gname = "_".join(name.split("_")[:-1]) if tf >= 1 else name
+        data = learned.get(gname)
+        if not isinstance(data, dict):
+            continue
+        updated = False
+        if "lifetime" in fields:
+            wt = data.get("lifetime", {}).get("mean")
+            if wt is not None:
+                task["resources"]["walltime"] = float(wt)
+                updated = True
+        if "mem" in fields:
+            mem = data.get("pss", {}).get("max")
+            if mem is not None:
+                task["resources"]["mem"] = float(mem)
+                updated = True
+        if "cpu" in fields:
+            cpu = data.get("cpu", {}).get("mean")
+            if cpu is not None:
+                task["resources"]["cpu"] = float(cpu)
+                updated = True
+        if updated:
+            n_updated += 1
+    return n_updated
+
+
 @dataclass
 class AmdahlModel:
     """Amdahl scaling model derived from a single measurement point.
@@ -426,14 +465,16 @@ def simulate(
                 proc_status[tid] = "Running"
                 res = rm.resources[tid]
                 if nice == rm.nice_default:
-                    wt = walltimes[tid] + task_overhead
+                    compute_wt = walltimes[tid]
+                    wt = compute_wt + task_overhead
                     finish = t + wt
+                    fg_cpu = res.cpu_assigned * (compute_wt / wt) if wt > 0 else 0.0
                     task = SimTask(
                         tid=tid,
                         name=workflow.id_to_name[tid],
                         start=t,
                         finish=finish,
-                        cpu=res.cpu_assigned,
+                        cpu=fg_cpu,
                         cpu_booked=res.cpu_assigned,
                         mem=res.mem_assigned,
                         walltime=wt,
@@ -570,13 +611,16 @@ def simulate(
             slowdown = 1.0
             if backfill_model == "slowdown" and nice != rm.nice_default:
                 slowdown = backfill_slowdown_factor
-            wt = walltimes[tid] * slowdown + task_overhead
+            compute_wt = walltimes[tid] * slowdown   # time spent doing actual work
+            wt = compute_wt + task_overhead           # total slot duration (incl. idle overhead)
             finish = t + wt
             running.append((tid, finish))
             candidates.remove(tid)
             proc_status[tid] = "Running"
             res = rm.resources[tid]
-            effective_cpu = res.cpu_assigned / slowdown
+            # Overhead is idle time (process start/stop, alienv load, I/O flush).
+            # Average CPU over the full slot = booked_cpu × compute_fraction only.
+            effective_cpu = res.cpu_assigned / slowdown * (compute_wt / wt) if wt > 0 else 0.0
             result.tasks.append(SimTask(
                 tid=tid,
                 name=workflow.id_to_name[tid],
@@ -705,9 +749,11 @@ def _print_sweep_table(
 
     # Build header with optional per-task worker columns.
     worker_cols = "  ".join(f"{n[:12]:>12}" for n in scalable_names)
+    cpu_col_hdr = f"{'CPU util(±std)':>14}" if stoch else f"{'CPU util':>9}"
     hdr = (f"  {'M':>4}  {'Policy':<16}  {'N tasks':>7}  "
-           f"{'Makespan':>12}  {'CPU util':>9}  {'Peak mem':>9}"
+           f"{'Makespan':>12}  {cpu_col_hdr}  {'Peak mem':>9}"
            + (f"  {worker_cols}" if scalable_names else ""))
+    cpu_col_w = 14 if stoch else 9
     print("\nTimeframe sweep results:")
     print(hdr)
     print("  " + "-" * (len(hdr) - 2))
@@ -722,10 +768,13 @@ def _print_sweep_table(
             if stoch and len(runs) > 1:
                 std_mk = statistics.stdev(makespans)
                 mk_str = f"{_fmt_time(mean_mk)}±{_fmt_time(std_mk)}"
+                std_util = statistics.stdev(r.cpu_utilization(cpu_limit) * 100 for r in runs)
+                util_str = f"{util_pct:.1f}±{std_util:.1f}%"
             else:
                 mk_str = _fmt_time(mean_mk)
+                util_str = f"{util_pct:.1f}%"
             row = (f"  {m_str:>4}  {policy:<16}  {n_stages:>7}  "
-                   f"{mk_str:>12}  {util_pct:>8.1f}%  {peak:>7.0f}MB")
+                   f"{mk_str:>12}  {util_str:>{cpu_col_w}}  {peak:>7.0f}MB")
             if scalable_names and worker_assignment:
                 wvals = "  ".join(
                     f"{worker_assignment.get(n, '-'):>12}"
@@ -825,9 +874,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("-f", "--workflowfile", required=True)
     p.add_argument("--update-resources", dest="update_resources", default=None,
-                   metavar="JSON",
-                   help="Apply learned resources (same file as --update-resources "
-                        "in the runner). Enables walltime-based critical path.")
+                   metavar="JSON[:FIELDS]",
+                   help="Apply learned resources from JSON (same file as "
+                        "--update-resources in the runner). Enables walltime-based "
+                        "critical path. Optionally restrict which dimensions are "
+                        "patched with a colon-separated field list chosen from "
+                        "{cpu,mem,lifetime}. Example: learned.json:lifetime applies "
+                        "only walltimes, keeping cpu/mem from workflow.json.")
     p.add_argument("--cpu-limit", type=float, default=8.0)
     p.add_argument("--mem-limit", type=float, default=60000.0, help="in MB")
     p.add_argument("--policies", nargs="+",
@@ -839,9 +892,14 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Fallback walltime per CPU core [s] when no learned "
                         "walltime is available.")
     p.add_argument("--task-overhead", type=float, default=0.1, metavar="S",
-                   help="Per-task scheduling overhead [s] added to every task's "
-                        "effective duration (covers systemd-run scope creation, "
-                        "bash/taskwrapper startup, etc.).")
+                   help="Per-task idle overhead [s] added to every task's slot "
+                        "duration (models alienv load, process startup, I/O flush, "
+                        "and scheduler reaction time).  This time contributes zero "
+                        "CPU to the utilisation numerator, so larger values lower "
+                        "both predicted makespan and CPU efficiency.  "
+                        "Default 0.1 s is conservative; calibration against "
+                        "measurements typically gives 5–7 s for production "
+                        "ALICE MC workflows.")
     p.add_argument("--backfill-model", default="off",
                    choices=["off", "structural", "slowdown", "holefill"],
                    help="Backfill approximation used by the simulator. "
@@ -905,19 +963,39 @@ def main(argv=None) -> int:
     raw = load_json(ns.workflowfile)
     target_tasks = [t.strip('"').strip("'") for t in ns.target_tasks]
 
+    # ── Parse --update-resources path[:field,field,...] ───────────────────────
+    ur_path: Optional[str] = None
+    ur_fields: Optional[Set[str]] = None   # None = all three fields
+    if ns.update_resources:
+        _parts = ns.update_resources.split(":", 1)
+        ur_path = _parts[0]
+        if len(_parts) > 1:
+            _raw_fields = {f.strip().lower() for f in _parts[1].split(",")}
+            _bad = _raw_fields - _LEARN_ALL
+            if _bad:
+                print(f"ERROR: unknown field(s) in --update-resources specifier: "
+                      f"{sorted(_bad)}.  Valid: cpu, mem, lifetime", file=sys.stderr)
+                return 1
+            ur_fields = _raw_fields
+
     # ── Load learned JSON once (independent of timeframe count) ──────────────
     walltime_stds: Dict[str, float] = {}
     learned_full: Dict = {}
     amdahl_models: Dict[str, AmdahlModel] = {}
 
-    if ns.update_resources:
-        print(f"Applying learned resources from {ns.update_resources} ...")
-        with open(ns.update_resources) as fh:
+    if ur_path:
+        _active = ur_fields if ur_fields is not None else _LEARN_ALL
+        _fields_str = ", ".join(sorted(_active))
+        print(f"Applying learned resources from {ur_path}"
+              + (f" (fields: {_fields_str})" if ur_fields is not None else "")
+              + " ...")
+        with open(ur_path) as fh:
             learned_full = json.load(fh)
+        apply_lifetime = "lifetime" in _active
         for name, data in learned_full.items():
             if name == "count":
                 continue
-            if ns.samples > 1:
+            if ns.samples > 1 and apply_lifetime:
                 std = data.get("lifetime", {}).get("std", 0.0) or 0.0
                 if std > 0:
                     walltime_stds[name] = float(std)
@@ -1013,8 +1091,11 @@ def main(argv=None) -> int:
             print(f"Workflow is empty after filtering (M={M}).")
             continue
 
-        if ns.update_resources:
-            update_resource_estimates(wf, ns.update_resources)
+        if ur_path:
+            if ur_fields is None:
+                update_resource_estimates(wf, ur_path)
+            else:
+                _apply_learned_fields(wf, learned_full, ur_fields)
             has_wt = sum(1 for t in wf.stages if t.get("resources", {}).get("walltime"))
             if not sweep_mode:
                 print(f"  {has_wt}/{len(wf.stages)} tasks have learned walltime.")
