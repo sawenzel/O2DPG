@@ -1805,6 +1805,12 @@ for tf in range(1, NTIMEFRAMES + 1):
    AODtask = createTask(name='aod_'+str(tf), needs=aodneeds, tf=tf, cwd=timeframeworkdir, lab=["AOD"], mem='4000', cpu='1')
    AODtask['cmd'] = ('','ln -nfs ../bkg_Kine.root . ;')[doembedding]
    AODtask['cmd'] += '[ -f AO2D.root ] && rm AO2D.root; '
+   # Remove the collisions borrowed from the previous timeframe (collision-context
+   # overlap from --orbitsEarly) before AOD creation, so that each timeframe owns a
+   # disjoint BC range and no MC collision is emitted into two consecutive timeframes'
+   # AODs. The cut is the start of the owning timeframe (orbitFirstSampled).
+   orbitFirstSampled = args.first_orbit + startOrbit
+   AODtask['cmd'] += 'root -q -b -l "${O2DPG_ROOT}/MC/utils/TrimCollisionContext.C(\\"' + CONTEXTFILE + '\\",' + str(orbitFirstSampled) + ')"; '
    AODtask['cmd'] += task_finalizer([
       "${O2_ROOT}/bin/o2-aod-producer-workflow",
       "--reco-mctracks-only 1",
