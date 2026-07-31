@@ -7,13 +7,48 @@ upstream of Track A's results section**. Otherwise they run in parallel.
 Companion document: `CODE_REVIEW.md` (findings referenced below as B1–B5,
 C1–C8, D1–D4).
 
+## Status (2026-07-31)
+
+**Track A is done.** `main.tex` builds at **8 pages**, no overfull boxes,
+no draft artefacts. Committed in the `CHEP26Proceedings` repo as
+"Trim proceedings to the 8-page limit". Base file decision: `main.tex`,
+confirmed to be the newest state — its uncommitted edits were back-ports
+from `main_alt.tex`. `main_alt.tex` is now a wording donor only; retiring
+it is still open (A4).
+
+**Track B0 is done.** The poster rebuilds from the repository alone.
+
+**Track B1+ is deferred by decision** — tooling fixes and production
+readiness are a separate, later step. Two decisions taken meanwhile:
+
+- **`--cgroup` (B1): retire it.** The feature is not worth carrying;
+  `--systemd-run` supersedes it. But retiring the *feature* is not the
+  same as removing the *flag*: the runner must still accept `--cgroup`
+  and ignore it with a warning, exactly as it already does for
+  `--webhook` and `--checkpoint-on-failure`. Otherwise any JDL passing it
+  through `ALIEN_O2DPG_ADDITIONAL_WORKFLOW_RUNNER_ARGS` aborts the job at
+  argparse time. One line in `cli.py`; revisit a real cgroup path only if
+  a site needs it.
+- **`--dynamic-resources` (B5): probably never ported.** Recorded for the
+  integration step. Note the discrepancy: the sibling-sampling machinery
+  *is* present and does work when driven directly (verified — three
+  siblings declared at 4.0 cores / 2000 MB were reassigned to 1.5 / 800
+  after the first completed). So whatever is missing is not the sampler.
+  Prime suspect is C3 (samples fed per poll rather than per monitor tick,
+  which defeats the "<3 samples" guard). Since `anchorMC.sh` passes this
+  flag unconditionally, it must be settled before the runner is flipped
+  on in production — but it does not block the proceedings.
+
 ---
 
 # Track A — proceedings to 8 pages
 
+*(Completed — kept as the record of what was cut and why.)*
+
 ## A0. Starting state (measured, not estimated)
 
-`main_alt.pdf` rebuilt from source: **10 pages**. Target 8.
+Both `main.pdf` and `main_alt.pdf` rebuilt from source: **10 pages**.
+Target 8.
 
 Content inventory of `main_alt.tex`:
 
@@ -70,7 +105,32 @@ in the abstract, it still has to be put there.
 
 ## A2. Layout savings — do these first (~1–1.25 pages)
 
-Ordered by yield per unit of effort. None of these remove content.
+**What actually worked, in hindsight.** The original diagnosis above
+attributed the slack to float *placement*, and that was wrong: relaxing
+`\topfraction`/`\textfraction`/`\totalnumber` changed the output by
+exactly zero pages. LaTeX was already placing the floats as tightly as
+it could. The space was going to the *separation* around them, and the
+fix was:
+
+```latex
+\setlength{\textfloatsep}{10pt plus 2pt minus 3pt}   % default 20pt
+\setlength{\intextsep}{8pt plus 2pt minus 2pt}       % default 12pt
+\setlength{\abovecaptionskip}{5pt}                   % default 10pt
+\setlength{\belowcaptionskip}{0pt}
+```
+
+With five floats that recovered ~110 pt on one page alone and was the
+single change that took the document from 9 pages to 8. Diagnose this
+kind of gap by measuring, not by eye:
+
+```bash
+pdftotext -f 7 -l 7 -bbox main.pdf - | grep -oE 'yMin="[0-9.]+"' \
+  | sed 's/[^0-9.]//g' | sort -n | uniq \
+  | awk 'NR>1{if($1-p>25) print "GAP", $1-p, "pt before y=", $1} {p=$1}'
+```
+
+The rest of the list below did contribute, and none of it removes
+content.
 
 1. **Merge Fig. 3 and Fig. 4 into one two-panel float.**
    `sim_vs_measured` (0.7\linewidth) and the `pilot`+`disc_compare` minipage

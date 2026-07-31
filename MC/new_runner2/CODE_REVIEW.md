@@ -37,7 +37,9 @@ the way `--webhook` and `--checkpoint-on-failure` are handled. Verified:
 o2dpg_workflow_runner.py: error: unrecognized arguments: --cgroup /sys/fs/cgroup/foo/cgroup.procs
 ```
 
-This matters because `anchorMC.sh:436` appends
+Decision taken: retire the *feature* (`--systemd-run` supersedes it) but
+keep accepting the *flag* as a no-op with a warning.  This matters
+because `anchorMC.sh:436` appends
 `${ALIEN_O2DPG_ADDITIONAL_WORKFLOW_RUNNER_ARGS}` — a JDL-controlled string.
 Any production JDL carrying `--cgroup` would fail the job at startup, before
 a single task runs. `MC/run/EmbeddingTest_OldRunner/run_OmegaCInjected.sh`
@@ -79,10 +81,11 @@ sgnsim_2: cpu=1.5 mem=800.0
 sgnsim_3: cpu=1.5 mem=800.0
 ```
 
-So the defect is not visible from the code or from a synthetic DAG. **This
-needs the concrete symptom you saw** before it can be closed; it is the one
-blocker I cannot specify further. See C3 for a related real defect on the
-same path that may or may not be what you hit.
+So the defect is not visible from the code or from a synthetic DAG.
+Reported recollection is that this path "was never really ported" — which
+does not match the sampler working when driven directly, so something
+narrower is missing.  See C3 for a real defect on the same path that is
+the prime suspect.  To be settled at integration time, not before.
 
 ## Correctness and robustness
 
