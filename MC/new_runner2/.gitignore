@@ -1,0 +1,21 @@
+# Local Python environment and bytecode
+.venv/
+__pycache__/
+*.py[cod]
+
+# LaTeX build products (poster.tex is the source of truth; see
+# CHEP_Poster/Makefile to rebuild)
+*.aux
+*.log
+*.nav
+*.out
+*.snm
+*.toc
+*.vrb
+*.fls
+*.fdb_latexmk
+*.synctex.gz
+
+# Built PDFs are reproducible from source; drop these lines if the
+# presented artefacts should be archived in git instead.
+CHEP_Poster/*.pdf
