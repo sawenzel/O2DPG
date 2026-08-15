@@ -53,12 +53,16 @@ def include_all_QC_finalization(ntimeframes, standalone, run, productionTag, con
            return re.sub(r'^json://', '', path)
 
     configFilePathOnDisk = remove_json_prefix(qcConfigPath)
-    # we check if the configFilePath actually exists in the currently loaded software. Otherwise we exit immediately and gracefully
-    task['cmd'] = ' if [ -f ' + configFilePathOnDisk + ' ]; then { '
-    task['cmd'] += f'o2-qc --config {qcConfigPath} --remote-batch {taskName}.root' + \
+    inputFileName = taskName + '.root'
+    # we check if the configFilePath actually exists in the currently loaded software, and that the merged
+    # input file was really produced for this task. Otherwise we exit immediately and gracefully
+    task['cmd'] = ' if [ ! -f ' + configFilePathOnDisk + ' ]; then { echo "Task ' + taskName + ' not performed due to config file not found "; } '
+    task['cmd'] += 'elif [ ! -f ' + inputFileName + ' ]; then { echo "Task ' + taskName + ' not performed due to merged input file ' + inputFileName + ' not found "; } '
+    task['cmd'] += 'else { '
+    task['cmd'] += f'o2-qc --config {qcConfigPath} --remote-batch {inputFileName}' + \
                   f' --override-values "qc.config.database.host={qcdbHost};qc.config.Activity.number={run};qc.config.Activity.type=PHYSICS;qc.config.Activity.periodName={productionTag};qc.config.Activity.beamType={beamType};qc.config.conditionDB.url={conditionDB}"' + \
                   ' ' + getDPL_global_options()
-    task['cmd'] += ' ;} else { echo "Task ' + taskName + ' not performed due to config file not found "; } fi'
+    task['cmd'] += ' ;} fi'
 
     stages.append(task)
 
