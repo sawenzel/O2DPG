@@ -60,7 +60,11 @@ fi
 # ----------- START ACTUAL JOB  -----------------------------
 
 # create workflow
-${O2DPG_ROOT}/MC/bin/o2dpg_qc_finalization_workflow.py -o qc_finalization.json -run ${ALIEN_JDL_LPMRUNNUMBER} -productionTag ${ALIEN_JDL_LPMPRODUCTIONTAG}
+# the collision system is only known to this job through the LPM interaction type; without it
+# the finalization would upload its objects with an empty beam type
+beamTypeOption=""
+[ ! -z "${ALIEN_JDL_LPMINTERACTIONTYPE}" ] && beamTypeOption="-beamType ${ALIEN_JDL_LPMINTERACTIONTYPE}"
+${O2DPG_ROOT}/MC/bin/o2dpg_qc_finalization_workflow.py -o qc_finalization.json -run ${ALIEN_JDL_LPMRUNNUMBER} -productionTag ${ALIEN_JDL_LPMPRODUCTIONTAG} ${beamTypeOption}
 
 # run workflow
 mv -v *.root ./QC/
