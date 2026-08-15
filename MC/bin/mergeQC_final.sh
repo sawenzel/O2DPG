@@ -69,7 +69,9 @@ ${O2DPG_ROOT}/MC/bin/o2dpg_qc_finalization_workflow.py -o qc_finalization.json -
 # run workflow
 mv -v *.root ./QC/
 ${O2DPG_ROOT}/MC/bin/o2_dpg_workflow_runner.py --keep-going -f qc_finalization.json
+finalizationRC=$?
 mv ./QC/*.root .
+[ ${finalizationRC} -ne 0 ] && echo "Error: QC finalization finished with failing tasks, see the task logs under QC/"
 
 # -----------------------------------------------------------
 
@@ -83,3 +85,7 @@ du -h --max-depth=1 .
 # full logs tar-ed for output, regardless the error code or validation
 #
 find ./ \( -name "*.log*" -o -name "*mergerlog*" -o -name "*serverlog*" -o -name "*workerlog*" \) | tar -czvf debug_log_archive.tgz -T -
+
+# the merged files and the logs above are complete at this point, so a partial finalization
+# can be reported without losing anything the job produced
+exit ${finalizationRC}
