@@ -134,6 +134,18 @@ jobs:
       - name: Run the FileIOGraph test suite
         run: python3 -m unittest discover -s UTILS/FileIOGraph/tests -t UTILS/FileIOGraph/tests
 
+  ccdbscan-tests:
+    name: CCDB run-coverage unit tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Run the CCDBScan test suite
+        working-directory: UTILS/CCDBScan
+        run: python3 -m unittest discover -s tests -t tests
+
   pylint:
     name: Pylint
     runs-on: ubuntu-latest
