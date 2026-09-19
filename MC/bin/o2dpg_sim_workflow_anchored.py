@@ -167,6 +167,73 @@ def parse_orbits_per_tf(orbitsPerTF, intRate):
     return -1
 
 
+def orbits_per_tf_verdict(orbitsPerTF, intRate, ntf, max_empty_prob, max_orbits):
+    """
+    Judge whether a number of orbits per timeframe is usable at a given interaction rate.
+
+    A timeframe of orbitsPerTF orbits holds mu = intRate * orbitsPerTF * LHCOrbitMUS collisions on
+    average, so a fraction exp(-mu) of the timeframes holds none at all. A timeframe without a
+    collision cannot be simulated: there is nothing to put in it, the rest of the workflow expects
+    one collision context per timeframe, and an empty timeframe that did survive would end up as an
+    empty collision table in the AOD, which is what O2-7093 is about.
+
+    Note that this must not be repaired by resampling until every timeframe holds a collision. That
+    conditions the multiplicity on being non-zero, turning Poisson(mu) into a zero-truncated Poisson
+    of mean mu/(1-exp(-mu)), i.e. it raises the effective interaction rate - by 37 % at 2.5 kHz with
+    6 orbits, and by a factor 8 at 232 Hz. The bias is largest exactly where the repair would be
+    needed, so the number of orbits has to be chosen instead.
+
+    max_orbits is the number of orbits per timeframe the data itself was taken with, from GRPECS.
+    A simulated timeframe must not be longer than a real one, so if even that is not enough the run
+    cannot be anchored at all and has to be left out of the production.
+
+    Returns (probability that a job of ntf timeframes contains an empty one, orbits needed to stay
+    below max_empty_prob, or -1 if not even max_orbits is enough).
+    """
+    if intRate is None or intRate <= 0:
+        return 0., orbitsPerTF
+
+    # the orbits-early slot is sampled as well, so a job of ntf timeframes has ntf+1 of them
+    nslots = ntf + 1
+
+    def job_empty_probability(orbits):
+        mu = intRate * orbits * LHCOrbitMUS * 1e-6
+        return 1. - math.pow(1. - math.exp(-mu), nslots)
+
+    p_job = job_empty_probability(orbitsPerTF)
+    if p_job <= max_empty_prob:
+        return p_job, orbitsPerTF
+
+    needed = -1
+    for orbits in range(orbitsPerTF + 1, max_orbits + 1):
+        if job_empty_probability(orbits) <= max_empty_prob:
+            needed = orbits
+            break
+    return p_job, needed
+
+
+def report_orbits_per_tf(run_number, orbitsPerTF, intRate, ntf, p_job, needed, data_orbits):
+    """Tell the operator, in one place, that this run and this timeframe length do not go together."""
+    mu = intRate * orbitsPerTF * LHCOrbitMUS * 1e-6
+    print(f"ERROR: run {run_number} has an interaction rate of {intRate:.0f} Hz. With {orbitsPerTF} orbits per")
+    print(f"ERROR: timeframe a timeframe holds {mu:.2f} collisions on average and {100*math.exp(-mu):.1f} % of them are")
+    print(f"ERROR: empty, so {100*p_job:.1f} % of the jobs would contain at least one timeframe without a")
+    print(f"ERROR: collision. Such a timeframe cannot be simulated.")
+    if needed > 0:
+        print(f"ERROR: Use at least {needed} orbits per timeframe for this run, or leave the run out of the")
+        print(f"ERROR: production.")
+    else:
+        mu_data = intRate * data_orbits * LHCOrbitMUS * 1e-6
+        print(f"ERROR: The data of this run were taken with {data_orbits} orbits per timeframe, and even that")
+        print(f"ERROR: leaves {mu_data:.2f} collisions per timeframe. A simulated timeframe must not be longer")
+        print(f"ERROR: than a real one, so there is no valid setting for this run: leave it out of the")
+        print(f"ERROR: production.")
+    if needed > 0:
+        print(f"ERROR: ALIEN_JDL_MC_ORBITS_PER_TF also accepts interaction-rate ranges, for example")
+        print(f"ERROR: '0:6000:32,6000:1000000:6', which picks the number from the rate of each run.")
+        print(f"ERROR: Pass --adjust-orbits-per-tf to raise it automatically instead of failing.")
+
+
 def retrieve_params_fromGRPECS_and_OrbitReset(ccdbreader, run_number, run_start, run_end):
     """
     Retrieves start of run (sor), end of run (eor) and other global parameters from the GRPECS object,
@@ -517,8 +584,16 @@ def main():
     parser.add_argument("--trig-eff", type=float, dest="trig_eff", help="Trigger eff needed for IR (default is automatic mode)", default=-1.0)
     parser.add_argument("--run-time-span-file", type=str, dest="run_span_file", help="Run-time-span-file for exclusions of timestamps (bad data periods etc.)", default="")
     parser.add_argument("--invert-irframe-selection", action='store_true', help="Inverts the logic of --run-time-span-file")
-    parser.add_argument("--orbitsPerTF", type=str, help="Force a certain orbits-per-timeframe number; Automatically taken from CCDB if not given.", default="")
+    parser.add_argument("--orbitsPerTF", type=str, help="Force a certain orbits-per-timeframe number; taken from CCDB if not given. Either a plain number, or interaction-rate ranges as 'lowIR:highIR:orbits,...' (e.g. '0:5000:64,5000:1000000:6') to pick the number from the rate of the run.", default="")
+    parser.add_argument("--max-empty-tf-probability", dest="max_empty_tf_probability", type=float,
+                        default=float(environ.get("ALIEN_JDL_MAX_EMPTY_TF_PROBABILITY", 0.05)),
+                        help="Refuse to anchor when the probability that a job contains a timeframe without any collision exceeds this. 0 disables the check.")
+    parser.add_argument("--adjust-orbits-per-tf", dest="adjust_orbits_per_tf", action='store_true',
+                        default=environ.get("ALIEN_JDL_ADJUST_ORBITS_PER_TF") is not None,
+                        help="Raise orbitsPerTF until the check above passes instead of refusing. Note that this lengthens the timeframe and multiplies the cost of a job; it does not change the interaction rate.")
     parser.add_argument('--publish-mcprodinfo', action='store_true', default=False, help="Publish MCProdInfo metadata to CCDB")
+    parser.add_argument('--check-only', dest="check_only", action='store_true', default=False,
+                        help="Only judge whether this run can be anchored with the given orbitsPerTF, then stop. Use to screen a run list before submitting a production.")
     parser.add_argument('--timeframeID', type=int, help="If given, anchor to this specific timeframe id within a run. Takes precendence over determination based on (split-id, prod-split, cycle)", default=-1)
     parser.add_argument('forward', nargs=argparse.REMAINDER) # forward args passed to actual workflow creation
     args = parser.parse_args()
@@ -586,14 +661,38 @@ def main():
     print ("Collision system ", ColSystem)
 
     # possibly overwrite the orbitsPerTF with some external choices
+    # we need the interaction rate both for the range syntax of --orbitsPerTF and for the
+    # minimum-collisions-per-timeframe guard below
+    run_rate, _ = retrieve_MinBias_CTPScaler_Rate(ctp_scalers, mid_run_timestamp/1000., args.trig_eff, grplhcif.getBunchFilling().getNBunches(), ColSystem, eCM)
+    # the timeframe length the data of this run were taken with; a simulated timeframe must not be
+    # longer than a real one, so this is the ceiling for everything below
+    data_orbits = GLOparams["OrbitsPerTF"]
     if args.orbitsPerTF!="":
-       # we actually need the interaction rate for this calculation
-       # let's use the one provided from IR.txt (async reco) as quick way to make the decision
-       run_rate, _ = retrieve_MinBias_CTPScaler_Rate(ctp_scalers, mid_run_timestamp/1000., args.trig_eff, grplhcif.getBunchFilling().getNBunches(), ColSystem, eCM)
        determined_orbits = parse_orbits_per_tf(args.orbitsPerTF, run_rate)
        if determined_orbits != -1:
          print("Adjusting orbitsPerTF from " + str(GLOparams["OrbitsPerTF"]) + " to " + str(determined_orbits))
          GLOparams["OrbitsPerTF"] = determined_orbits
+
+    # a timeframe that holds no collision cannot be simulated, so make sure the choice above
+    # is compatible with the interaction rate of this run
+    if args.max_empty_tf_probability > 0:
+       if GLOparams["OrbitsPerTF"] > data_orbits:
+          print(f"WARNING: {GLOparams['OrbitsPerTF']} orbits per timeframe is more than the {data_orbits} the data of run "
+                f"{args.run_number} were taken with; a simulated timeframe should not be longer than a real one.")
+       p_job, needed = orbits_per_tf_verdict(GLOparams["OrbitsPerTF"], run_rate, args.tf, args.max_empty_tf_probability, data_orbits)
+       if needed != GLOparams["OrbitsPerTF"]:
+          report_orbits_per_tf(args.run_number, GLOparams["OrbitsPerTF"], run_rate, args.tf, p_job, needed, data_orbits)
+          if args.adjust_orbits_per_tf and needed > 0:
+             print(f"WARNING: raising orbitsPerTF from {GLOparams['OrbitsPerTF']} to {needed} as requested.")
+             GLOparams["OrbitsPerTF"] = needed
+          else:
+             return {}, {}
+       else:
+          print(f"orbitsPerTF {GLOparams['OrbitsPerTF']} is fine for this run: "
+                f"{100*p_job:.3f} % of the jobs would hold an empty timeframe")
+    if args.check_only:
+       print("Feasibility check only, not creating a workflow.")
+       return
 
     # determine timestamp, and production offset for the final MC job to run
     timestamp = 0
