@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 import os
+import tempfile
 import unittest
 from unittest import mock
 
@@ -39,8 +40,8 @@ class TestSelection(unittest.TestCase):
         self.assertEqual(manager("").backends, [])
 
     def test_named_backends_are_built_in_order(self):
-        self.assertEqual([b.name for b in manager("stub,fanotify").backends],
-                         ["stub", "fanotify"])
+        self.assertEqual([b.name for b in manager("stub,fanotify,strace").backends],
+                         ["stub", "fanotify", "strace"])
 
     def test_legacy_variable_selects_fanotify_with_that_exe(self):
         os.environ["O2DPG_PRODUCE_FILEGRAPH"] = "/opt/mon.exe"
@@ -83,6 +84,41 @@ class TestWrapping(unittest.TestCase):
         m.start()
         m.stop()
         self.assertEqual(m.analyse(), {})
+
+
+class TestStraceWrapping(unittest.TestCase):
+    ARGV = ["/bin/bash", "-c", "echo hi"]
+
+    def _backend(self, exe="strace"):
+        d = tempfile.TemporaryDirectory()
+        self.addCleanup(d.cleanup)
+        b = filegraph.StraceBackend(d.name, 4242, "action.log", LOG, exe=exe)
+        b.start()
+        return b
+
+    def test_the_task_command_stays_the_tail(self):
+        b = self._backend()
+        if not b._argv:
+            self.skipTest("strace not installed")
+        argv = b.wrap(list(self.ARGV), "sgnsim_1", 3)
+        self.assertEqual(argv[argv.index("--") + 1:], self.ARGV)
+        self.assertIn("-f", argv)
+        self.assertIn("-y", argv)
+        # the trace file name is the whole attribution mechanism
+        self.assertIn("trace_3_sgnsim_1.log", " ".join(argv))
+
+    def test_a_missing_strace_leaves_the_command_alone(self):
+        b = self._backend(exe="/nonexistent/strace")
+        self.assertEqual(b.wrap(list(self.ARGV), "sgnsim_1", 3), self.ARGV)
+
+    def test_traced_syscalls_are_the_ones_the_analyser_parses(self):
+        import analyse_FileIO_strace as A
+        traced = set(filegraph.StraceBackend.SYSCALLS.split(","))
+        self.assertTrue(set(A.OPEN_CALLS) <= traced)
+        self.assertTrue({"rename", "renameat", "renameat2"} <= traced)
+        # nothing is traced that nothing reads
+        self.assertEqual(traced - set(A.OPEN_CALLS)
+                         - {"rename", "renameat", "renameat2"}, set())
 
 
 class TestReportNames(unittest.TestCase):
