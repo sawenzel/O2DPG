@@ -1,0 +1,18 @@
+"""Put the FileIOGraph tools and the runner package on sys.path.
+
+Every test module here imports this first, so there is one convention for
+reaching both trees instead of a bootstrap per file.
+"""
+import os
+import sys
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
+FILEGRAPH_DIR = os.path.dirname(_HERE)
+REPO = os.path.dirname(os.path.dirname(FILEGRAPH_DIR))
+RUNNER_BIN = os.path.join(REPO, "MC", "new_runner2", "MC", "bin")
+
+for _p in (FILEGRAPH_DIR, RUNNER_BIN):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+
+from o2dpg_runner import filegraph  # noqa: E402,F401
