@@ -130,7 +130,58 @@ class FanotifyBackend(FileGraphBackend):
         return ["--actionFile", self.action_log, "--monitorFile", self.logfile]
 
 
-BACKENDS = {b.name: b for b in (FanotifyBackend,)}
+class StraceBackend(FileGraphBackend):
+    """Wraps every task in its own strace; attribution is by construction."""
+
+    name = "strace"
+    analyser = "analyse_FileIO_strace.py"
+    #: must stay in step with what analyse_FileIO_strace.py parses
+    SYSCALLS = "openat,openat2,open,creat,rename,renameat,renameat2"
+
+    def __init__(self, workdir, runner_pid, action_log, logger,
+                 exe: str = "strace"):
+        super().__init__(workdir, runner_pid, action_log, logger)
+        self.exe = exe
+        self.tracedir = os.path.join(workdir, f"strace_{runner_pid}")
+        self._argv: List[str] = []
+
+    def start(self) -> None:
+        if not shutil.which(self.exe):
+            self.log.error("filegraph strace: %s not found on PATH", self.exe)
+            return
+        argv = [self.exe, "-f", "-qq", "-y",
+                "-e", f"trace={self.SYSCALLS}", "-e", "status=successful"]
+        # without --seccomp-bpf every read() costs two ptrace stops
+        if self._seccomp_works(argv):
+            argv.insert(1, "--seccomp-bpf")
+        os.makedirs(self.tracedir, exist_ok=True)
+        self._argv = argv
+        self.log.info("filegraph strace: %s -> %s", " ".join(argv), self.tracedir)
+
+    def _seccomp_works(self, argv: List[str]) -> bool:
+        try:
+            r = subprocess.run(argv[:1] + ["--seccomp-bpf"] + argv[1:]
+                               + ["-o", os.devnull, "true"],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                               timeout=60)
+            return r.returncode == 0
+        except (OSError, subprocess.SubprocessError):
+            return False
+
+    def wrap(self, argv, taskname, tid):
+        if not self._argv:
+            return argv
+        trace = os.path.join(self.tracedir, f"trace_{tid}_{taskname}.log")
+        return self._argv + ["-o", trace, "--"] + list(argv)
+
+    def recorded(self) -> bool:
+        return os.path.isdir(self.tracedir)
+
+    def analyser_args(self) -> List[str]:
+        return ["--straceDir", self.tracedir]
+
+
+BACKENDS = {b.name: b for b in (FanotifyBackend, StraceBackend)}
 
 
 class FileGraphManager:
