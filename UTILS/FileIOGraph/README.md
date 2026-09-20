@@ -85,11 +85,6 @@ synthetic workflow still carries its own analytic truth.
 
 Offline tests: `python3 -m unittest discover -s tests -t tests`.
 
-What the two backends measure against each other on a real MC pilot is in
-[EVIDENCE.md](EVIDENCE.md), which also records a third, inotify-based
-backend that was built and measured on the `swenzel/filegraph-inotify`
-branch.
-
 ## Building
 
 ```bash
