@@ -38,7 +38,7 @@ from .filegraph import FileGraphManager
 from .scheduler import get_policy
 from .scheduler.base import SchedulerState
 from .scheduler.timeframe import TimeframeFirstPolicy
-from .cache import TaskCache, compute_fingerprint, remove_done_flag, done_path
+from .cache import TaskCache, compute_fingerprint, remove_done_flag
 from .alienv import get_alienv_software_environment
 from .cleanup import EarlyFileRemover, archive_task_logs
 
@@ -436,15 +436,12 @@ class WorkflowExecutor:
             p = self.submit(tid, nice)
             if p is None:
                 continue
-            # pin the nice value the OS actually granted (only psutil.Popen
-            # has .nice(); dry-run uses plain subprocess.Popen)
-            actual_nice = nice
-            nice_fn = getattr(p, "nice", None)
-            if callable(nice_fn):
-                try:
-                    actual_nice = nice_fn()
-                except (psutil.NoSuchProcess, psutil.AccessDenied):
-                    actual_nice = nice
+            # pin the nice value the OS actually granted; dry-run uses a plain
+            # subprocess.Popen, which has no nice()
+            try:
+                actual_nice = p.nice()
+            except (AttributeError, psutil.NoSuchProcess, psutil.AccessDenied):
+                actual_nice = nice
             self.rm.book(tid, actual_nice)
             self.process_list.append((tid, p))
             if tid in candidates:

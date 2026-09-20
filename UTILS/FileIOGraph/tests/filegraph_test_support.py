@@ -1,7 +1,7 @@
 """Put the FileIOGraph tools and the runner package on sys.path.
 
-Every test module here imports this first, so there is one convention for
-reaching both trees instead of a bootstrap per file.
+Imported first by every test module here, so there is one bootstrap
+instead of one per file.
 """
 import os
 import sys
@@ -15,4 +15,6 @@ for _p in (FILEGRAPH_DIR, RUNNER_BIN):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-from o2dpg_runner import filegraph  # noqa: E402,F401
+from o2dpg_runner import filegraph  # noqa: E402
+
+__all__ = ["FILEGRAPH_DIR", "REPO", "RUNNER_BIN", "filegraph"]

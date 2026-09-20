@@ -8,7 +8,6 @@ are preserved; new flags are additive and default-compatible.
 from __future__ import annotations
 
 import argparse
-import json
 import logging
 import os
 import shutil
@@ -18,7 +17,7 @@ from typing import Optional, Tuple
 import psutil
 
 from .config import RunnerConfig
-from .filegraph import FileGraphManager
+from .filegraph import BACKENDS as FILEGRAPH_BACKENDS, FileGraphManager
 from .workflow import build_workflow, load_json
 from .executor import WorkflowExecutor
 
@@ -102,8 +101,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--remove-files-early", type=str, default="")
     p.add_argument("--filegraph-backends", type=str,
                    default=os.getenv("O2DPG_FILEGRAPH_BACKENDS", ""),
-                   help="comma-separated file-IO-graph backends to run "
-                        "during this run, e.g. fanotify")
+                   help="comma-separated file-IO-graph backends to learn the "
+                        "file dependencies with: "
+                        + ", ".join(sorted(FILEGRAPH_BACKENDS)))
 
     # Accept-and-ignore for backward compatibility of call sites
     # that still pass these flags. They have no effect.

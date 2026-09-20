@@ -1,9 +1,7 @@
-"""Report construction shared by every file-graph backend.
+"""Build the file-task dependency report from two file->tasks maps.
 
-Whatever observed the accesses, the result is the same two maps -- file to
-the tasks that wrote it and file to the tasks that read it.  Everything
-downstream of that lives here, so a comparison between two backends
-measures the observation and not this code.
+Holds the exclusion rules, the ./tfN -> ./tfX templating, the JSON schema
+that --remove-files-early reads back, and the graphviz rendering.
 """
 from __future__ import annotations
 
