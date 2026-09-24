@@ -414,11 +414,11 @@ def retrieve_MinBias_CTPScaler_Rate(raw_rate_at, finaltime, trig_eff_arg, NBunch
     # invert the Poisson zero-probability to get the mean number of triggering interactions per
     # colliding crossing, then divide by the efficiency to get all of them
     trigger_prob_per_bc = raw_rate / 11245 / coll_bunches
-    if trigger_prob_per_bc >= 1.:
-      print(f"[ERROR]: Raw scaler rate {raw_rate} Hz is not below the {coll_bunches} * 11245 Hz of "
-            f"colliding bunch crossings of run {run_number}; cannot determine interaction rate; "
-            f"Some (external) default used")
-      return None, None
+    # a saturated counter gives no usable rate: errors grow as 1/(1-p) and pile-up fakes coincidences
+    if trigger_prob_per_bc >= 0.9:
+      print(f"[FATAL]: Trigger probability {trigger_prob_per_bc:.4f} per colliding bunch crossing in run "
+            f"{run_number}; CTP counter saturated, cannot determine interaction rate")
+      exit(1)
 
     mu = - math.log(1. - trigger_prob_per_bc) / effTrigger
     finalRate = coll_bunches * mu * 11245
