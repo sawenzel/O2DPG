@@ -516,7 +516,10 @@ BCPATTERN=args.bcPatternFile
 
 # ----- global background specific stuff -------
 COLTYPEBKG=args.colBkg
-havePbPb = (COLTYPE == 'PbPb' or (doembedding and COLTYPEBKG == "PbPb"))
+# the physical collision system: the background one when embedding
+COLTYPEPHYS = COLTYPEBKG if doembedding else COLTYPE
+PDGAPHYS, PDGBPHYS = colsys.get(COLTYPEPHYS, (PDGA, PDGB))
+havePbPb = (COLTYPEPHYS == 'PbPb')
 
 workflow={}
 workflow['stages'] = []
@@ -622,7 +625,7 @@ workflow['stages'].append(GRP_TASK)
 # QED background is enabled by default only for same-species (heavy-ion) collisions.
 # --with-qed forces it on; --no-qed forces it off and wins over both the default and --with-qed
 # (the two flags are mutually exclusive at the argparse level, so they can never both be set).
-QED_enabled = True if (PDGA==PDGB and PDGA!=2212) else False
+QED_enabled = True if (PDGAPHYS==PDGBPHYS and PDGAPHYS!=2212) else False
 includeQED = (QED_enabled or args.with_qed) and not args.no_qed
 signalprefix='sgn'
 
@@ -658,12 +661,12 @@ if doembedding:
 
 qedspec=""
 if includeQED:
-   if PDGA==2212 or PDGB==2212:
+   if PDGAPHYS==2212 or PDGBPHYS==2212:
       # QED is not enabled for pp and pA collisions
       print('o2dpg_sim_workflow: Warning! QED is not enabled for pp or pA collisions')
       includeQED = False
    else:
-      qedrate = INTRATE * QEDXSecExpected[COLTYPE] / XSecSys[COLTYPE]   # hadronic interaction rate * cross_section_ratio
+      qedrate = INTRATE * QEDXSecExpected[COLTYPEPHYS] / XSecSys[COLTYPEPHYS]   # hadronic interaction rate * cross_section_ratio
       # the QED events are reused in a round robin, so both numbers are the size of the QED pool.
       # Older O2 versions wrap the QED event IDs at the first number instead of the second one and
       # would otherwise put event IDs into the MC labels which are not in the QED kinematics.
@@ -865,7 +868,7 @@ for tf in range(1, NTIMEFRAMES + 1):
      ########################################################################################################
 
      # determine final conf key for QED simulation
-     QEDBaseConfig = "GeneratorExternal.fileName=$O2_ROOT/share/Generators/external/QEDLoader.C;QEDGenParam.yMin=-7;QEDGenParam.yMax=7;QEDGenParam.ptMin=0.001;QEDGenParam.ptMax=1.;QEDGenParam.xSectionHad="+str(XSecSys[COLTYPE])+";QEDGenParam.Z="+str(Zsys[COLTYPE])+";QEDGenParam.cmEnergy="+str(ECMS)+";Diamond.width[2]=6.;"
+     QEDBaseConfig = "GeneratorExternal.fileName=$O2_ROOT/share/Generators/external/QEDLoader.C;QEDGenParam.yMin=-7;QEDGenParam.yMax=7;QEDGenParam.ptMin=0.001;QEDGenParam.ptMax=1.;QEDGenParam.xSectionHad="+str(XSecSys[COLTYPEPHYS])+";QEDGenParam.Z="+str(Zsys[COLTYPEPHYS])+";QEDGenParam.cmEnergy="+str(ECMS)+";Diamond.width[2]=6.;"
      QEDCONFKEY = constructConfigKeyArg(create_geant_config(args, QEDBaseConfig + args.confKeyQED))
      qed_detectorlist = ' ITS MFT FT0 FV0 FDD '
      if args.detectorList == 'ALICE2.1':
@@ -878,9 +881,9 @@ for tf in range(1, NTIMEFRAMES + 1):
                         + ' --detectorList ' + args.detectorList + ' '                                                \
                         + QEDCONFKEY
      QED_task['cmd'] += '; RC=$?; QEDXSecCheck=`grep xSectionQED qedgenparam.ini | sed \'s/xSectionQED=//\'`'
-     QED_task['cmd'] += '; echo "CheckXSection ' + str(QEDXSecExpected[COLTYPE]) + ' = $QEDXSecCheck"; [[ ${RC} == 0 ]]'
+     QED_task['cmd'] += '; echo "CheckXSection ' + str(QEDXSecExpected[COLTYPEPHYS]) + ' = $QEDXSecCheck"; [[ ${RC} == 0 ]]'
      # TODO: propagate the Xsecion ratio dynamically
-     QEDdigiargs=' --simPrefixQED qed' +  ' --qed-x-section-ratio ' + str(QEDXSecExpected[COLTYPE]/XSecSys[COLTYPE])
+     QEDdigiargs=' --simPrefixQED qed' +  ' --qed-x-section-ratio ' + str(QEDXSecExpected[COLTYPEPHYS]/XSecSys[COLTYPEPHYS])
      workflow['stages'].append(QED_task)
 
    # recompute the number of workers to increase CPU efficiency
@@ -1144,7 +1147,7 @@ for tf in range(1, NTIMEFRAMES + 1):
        print('Warning: lumi scaling requested, but no ctp scaler value set. Full map will be applied at face value.')
        tpcDistortionType=1
    lumiInstFactor=1
-   if COLTYPE == 'PbPb':
+   if COLTYPEPHYS == 'PbPb':
       lumiInstFactor=2.414
    if tpcDistortionType == 2:
       tpcLocalCF['TPCCorrMap.lumiInst'] = str(CTPSCALER * lumiInstFactor)
@@ -1337,7 +1340,7 @@ for tf in range(1, NTIMEFRAMES + 1):
       tpcLocalCFreco['TPCCorrMap.lumiInst'] = str(CTPSCALER)
       tpcLocalCFreco['TPCCorrMap.lumiMean'] = str(CTPSCALER)
    elif tpcDistortionType == 2: # full scaling with CTP values
-      if COLTYPE == 'PbPb':
+      if COLTYPEPHYS == 'PbPb':
          tpcLocalCFreco['TPCCorrMap.lumiInstFactor'] = str(lumiInstFactor)
       tpc_corr_options_mc=' --corrmap-lumi-mode ' + str(tpcCorrmapLumiMode) + ' '
       tpcLocalCFreco['TPCCorrMap.lumiInst'] = str(CTPSCALER)

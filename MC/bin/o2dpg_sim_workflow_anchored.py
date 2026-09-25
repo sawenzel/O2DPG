@@ -742,8 +742,10 @@ def main():
     forwardargs += " -tf " + str(args.tf) + " --sor " + str(effective_run_start) + " --timestamp " + str(timestamp) + " --production-offset " + str(prod_offset) + " -run " + str(args.run_number) + " --run-anchored --first-orbit "       \
                    + str(effective_first_orbit) + " --orbitsPerTF " + str(GLOparams["OrbitsPerTF"]) + str(energyarg)
     # the following options can be overwritten/influenced from the outside
-    if not re.search(r'(?<!\S)-col(?=[\s=])', forwardargs):
-       forwardargs += ' -col ' + ColSystem
+    # under embedding the anchored system is the background one; -col is the signal
+    colopt = '-colBkg' if re.search(r'(?<!\S)--embedding(?!\S)', forwardargs) else '-col'
+    if not re.search(r'(?<!\S)' + colopt + r'(?=[\s=])', forwardargs):
+       forwardargs += ' ' + colopt + ' ' + ColSystem
     if not '--readoutDets' in forwardargs:
        forwardargs += ' --readoutDets ' + GLOparams['detList']
     if not '-field' in forwardargs:
