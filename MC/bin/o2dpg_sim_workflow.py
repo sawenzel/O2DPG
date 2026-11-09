@@ -1179,11 +1179,16 @@ for tf in range(1, NTIMEFRAMES + 1):
                          + ' --tpc-distortion-type ' + str(tpcDistortionType)                                                             \
                          + putConfigValues(["TPCGasParam","TPCGEMParam","TPCEleParam","TPCITCorr","TPCDetParam"],
                                               localCF=tpcLocalCF)
+   # the scaled distortions are computed once per job and shared through a file by all digitizers
+   tpcDistortionFile = tpcDistortionType == 2 and option_if_available('o2-sim-digitizer-workflow', '--tpc-distortion-file') != ''
+   if tpcDistortionFile:
+      TPCDigitask['cmd'] += ' --tpc-distortion-file ../tpc_scaled_distortions.root'
    if args.tpc_mt_digitizer:
       # one device with NWORKERS_TF threads; it always seeds per sector
       TPCDigitask['cmd'] += ' --tpc-digi-threads ' + str(NWORKERS_TF) + ' --n-threads-distortions ' + str(NWORKERS_TF)
    else:
-      TPCDigitask['cmd'] += ' --tpc-lanes ' + str(NWORKERS_TF) + ' --n-threads-distortions 1'
+      # with the file only one lane computes the distortions while the others wait
+      TPCDigitask['cmd'] += ' --tpc-lanes ' + str(NWORKERS_TF) + ' --n-threads-distortions ' + (str(NWORKERS_TF) if tpcDistortionFile else '1')
       TPCDigitask['cmd'] += ('',' --tpc-sector-seeding')[args.tpc_sector_seeding]
    TPCDigitask['cmd'] += (' --tpc-chunked-writer','')[args.no_tpc_digitchunking]
    TPCDigitask['cmd'] += ('',' --disable-mc')[args.no_mc_labels]
